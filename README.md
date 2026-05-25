@@ -1,2 +1,2 @@
-# dorothy
-SO-101 plays chess against you.
+# DOROTHY
+SO-101 robot arm plays chess against you.
