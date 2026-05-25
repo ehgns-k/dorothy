@@ -1,0 +1,14 @@
+calibration.json
+device_config.json
+stockfish/
+*.exe
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.python-version
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+chesscog/
