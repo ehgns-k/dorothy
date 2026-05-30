@@ -6,23 +6,27 @@ USB camera + SO-101 follower arm playing chess against you via Stockfish.
 
 First, create a virtual environment with Python version 3.10.
 
-```
+```cmd
 conda create -n dorothy python=3.10 && conda activate dorothy
 ```
 
 Clone [Chesscog](https://github.com/georg-wolflein/chesscog.git) directory inside project directory.
 
-```
+```cmd
 git clone https://github.com/georg-wolflein/chesscog.git
 ```
 
-It should look like `dorothy/chesscog/`. Inside the cloned `chesscog/` directory, go to `chesscog/corner_detection/detect_corners.py`, and replace line 207 to `agg = AgglomerativeClustering(n_clusters=2, metric="precomputed", linkage="average")`.
+It should look like `dorothy/chesscog/`. Inside the cloned `chesscog/` directory, go to `chesscog/corner_detection/detect_corners.py`, and replace line 207 to the followning.
+
+```Python
+agg = AgglomerativeClustering(n_clusters=2, metric="precomputed", linkage="average")
+```
 
 Install Chesscog as Python package. For example, using Poetry, go inside the cloned `chesscog/` directory (`dorothy/chesscog/`) and do `poetry install`.
 
 Then, you should be able to install the pre-trained ResNet model from Chesscog with the following script:
 
-```
+```cmd
 python -m chesscog.occupancy_classifier.download_model
 ```
 
