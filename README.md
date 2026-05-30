@@ -1,6 +1,6 @@
 # DOROTHY - Chess Robot
 
-USB camera + SO-101 follower arm playing chess against you via Stockfish.
+Play chess against your SO-101 follower arm.
 
 ## Setup
 
@@ -38,4 +38,4 @@ Run `find_port.py`. The script will find ports of your SO-101 arm and your camer
 
 Then run `calibration.py`, which will write `calibration.json` file that contains calibration data of your SO-101 arm.
 
-Finally, run `main.py`, and enjoy the chess game against your SO-101 arm!
+Finally, run `main.py`, and enjoy a game of chess against your SO-101!
