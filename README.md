@@ -22,7 +22,9 @@ It should look like `dorothy/chesscog/`. Inside the cloned `chesscog/` directory
 agg = AgglomerativeClustering(n_clusters=2, metric="precomputed", linkage="average")
 ```
 
-Install Chesscog as Python package. For example, using Poetry, go inside the cloned `chesscog/` directory (`dorothy/chesscog/`) and do `poetry install`.
+Now you should install Chesscog as a Python package. We recommend using Poetry. 
+
+Using Poetry, go inside the cloned `chesscog/` directory (`dorothy/chesscog/`) and do `poetry install`.
 
 Then, you should be able to install the pre-trained ResNet model from Chesscog with the following script:
 
