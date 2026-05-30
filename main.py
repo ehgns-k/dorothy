@@ -26,7 +26,7 @@ from module import ChessVision, RobotMotion, DEVICE_CONFIG_FILE
 
 ROBOT_COLOR = chess.WHITE       # chess.WHITE (robot first) or chess.BLACK
 ENGINE_PATH = "C:\\Users\\hhung\\CNSCI\\stockfish\\stockfish-windows-x86-64-avx2.exe"
-ENGINE_THINK_TIME_S = 0.0001
+ENGINE_THINK_TIME_S = 0.000005
 DETECTION_ITERATIONS = 5        # camera reads per <ENTER>/<SPACE>; unioned
 
 CONFIRM_KEYS = {"\r", "\n", " "}
@@ -184,7 +184,7 @@ def print_turn_header(board: chess.Board, include_keys: bool,
         print(f"Your turn. (iters={it}, threshold={th:.3f})")
         print("  <ENTER>/<SPACE> = move played    <B> = recalibrate board")
         print("  <C> = recalibrate robot          <I> = set iterations")
-        print("  <T> = set threshold              <Q> = quit")
+        print("  <T> = retune threshold           <Q> = quit")
 
 
 def handle_robot_turn(board: chess.Board, motion: RobotMotion,
@@ -219,7 +219,7 @@ def handle_human_turn(board: chess.Board, vision: ChessVision,
             continue
 
         if k == "C":
-            if input("Calibration takes a long time. Proceed? (y/n): ").strip().lower() == "y":
+            if input("Calibration takes a long time. Proceed? (Y/n): ").strip().lower() in ("", "y"):
                 motion.calibrate()
             continue
 
@@ -228,11 +228,11 @@ def handle_human_turn(board: chess.Board, vision: ChessVision,
             continue
 
         if k == "T":
-            prompt_set_threshold(vision)
+            run_threshold_grid_search(vision, board)
             continue
 
         if k == "Q":
-            if input("Quit the game? (y/n): ").strip().lower() == "y":
+            if input("Quit the game? (Y/n): ").strip().lower() in ("", "y"):
                 return False
 
 
@@ -270,6 +270,28 @@ def prompt_set_threshold(vision: ChessVision) -> None:
     print(f"  -> threshold = {v:.3f}")
 
 
+def run_threshold_grid_search(vision: ChessVision, board: chess.Board) -> None:
+    """Grid-search the occupancy threshold against `board`'s expected
+    occupancy; offer accept / manual / decline."""
+    result = vision.grid_search_threshold(board)
+    lo, hi = result["range"]
+    range_str = (f"{result['best']:.3f}" if lo == hi
+                 else f"{result['best']:.3f}  (tied range {lo:.3f}..{hi:.3f})")
+    print(f"\n  Grid search result:")
+    print(f"    best threshold = {range_str}")
+    print(f"    accuracy       = {result['accuracy']}/{result['total']}")
+    print(f"    current        = {vision.occupancy_threshold:.3f}")
+    print("  <ENTER>/<SPACE> = accept   <M> = enter manually   <D> = decline")
+    k = wait_for_key(CONFIRM_KEYS | {"M", "D"})
+    if k in CONFIRM_KEYS:
+        vision.occupancy_threshold = result["best"]
+        print(f"  -> threshold = {result['best']:.3f}")
+    elif k == "M":
+        prompt_set_threshold(vision)
+    else:
+        print("  Declined; threshold unchanged.")
+
+
 def main() -> None:
     print("=== Chess Robot Framework ===\n")
 
@@ -304,7 +326,7 @@ def main() -> None:
     print("\n[Startup] Detecting board corners...")
     motion.go_to_init()
     while not vision.detect_board_corners():
-        if input("Retry? (y/n): ").strip().lower() != "y":
+        if input("Retry? (Y/n): ").strip().lower() not in ("", "y"):
             engine.quit()
             motion.disconnect()
             vision.release()
@@ -312,6 +334,7 @@ def main() -> None:
 
     board = chess.Board()
     settings = Settings()
+    run_threshold_grid_search(vision, board)
     print(f"\nGame on. Robot plays {'WHITE' if ROBOT_COLOR == chess.WHITE else 'BLACK'}.")
 
     try:
