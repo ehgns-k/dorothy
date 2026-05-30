@@ -147,25 +147,65 @@ class ChessVision:
                 break
         cv2.destroyAllWindows()
 
-        if input("Accept these corners? (y/n): ").strip().lower() == "y":
+        if input("Accept these corners? (Y/n): ").strip().lower() in ("", "y"):
             self.board_corners = corners
             print("  Board corners saved.")
             return True
         print("  Corners rejected.")
         return False
 
-    def _classify_occupancy(self, img: np.ndarray) -> np.ndarray:
+    def _per_square_probs(self, img: np.ndarray) -> np.ndarray:
+        """P(occupied) for each chess.SQUARES index, indexed in the raw
+        white-side frame (pre-orientation-flip)."""
         warped = occ_dataset.warp_chessboard_image(img, self.board_corners)
         crops = [occ_dataset.crop_square(warped, sq, chess.WHITE) for sq in self._squares]
         tensors = device(torch.stack(
             [self._occ_transforms(PILImage.fromarray(c)) for c in crops]))
         with torch.no_grad():
             probs = torch.softmax(self._occ_model(tensors), dim=-1)
-        mask = (probs[:, self._occ_occupied_idx].cpu().numpy()
-                >= self.occupancy_threshold)
+        return probs[:, self._occ_occupied_idx].cpu().numpy()
+
+    def _classify_occupancy(self, img: np.ndarray) -> np.ndarray:
+        mask = self._per_square_probs(img) >= self.occupancy_threshold
         if self.robot_color == chess.BLACK:
             mask = mask[::-1]
         return mask
+
+    def grid_search_threshold(self, board: chess.Board,
+                              low: float = 0.005,
+                              high: float = 0.500,
+                              step: float = 0.005) -> dict:
+        """Sweep thresholds in [low, high] at `step` increments and pick the
+        one whose mask best matches the canonical occupancy of `board`.
+        Ties broken by the middle of the tied range for robustness.
+
+        Returns: {"best", "accuracy", "total", "range": (lo, hi)}.
+        """
+        p = self._per_square_probs(self.capture_image())
+        # Expected mask is indexed by chess.SQUARES; the raw probabilities
+        # are in pre-flip white-side frame, so flip expected to align.
+        expected = np.array([board.piece_at(sq) is not None
+                             for sq in chess.SQUARES])
+        if self.robot_color == chess.BLACK:
+            expected = expected[::-1]
+
+        thresholds = np.arange(low, high + step / 2, step)
+        best_acc = -1
+        tied: list = []
+        for t in thresholds:
+            acc = int(np.sum((p >= t) == expected))
+            if acc > best_acc:
+                best_acc = acc
+                tied = [t]
+            elif acc == best_acc:
+                tied.append(t)
+
+        return {
+            "best": float(tied[len(tied) // 2]),
+            "accuracy": best_acc,
+            "total": len(expected),
+            "range": (float(tied[0]), float(tied[-1])),
+        }
 
     def detect_occupancy(self) -> Optional[list]:
         if self.board_corners is None:
