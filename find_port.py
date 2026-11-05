@@ -1,105 +1,78 @@
-"""Identify the USB serial port of the SO-101 and the USB camera index;
-save both to device_config.json. Run: python find_port.py
+"""Find the SO-101 serial port and the overhead camera; write
+device_config.json. Run: python find_port.py
+
+Stable device names are used (/dev/serial/by-id, /dev/v4l/by-id) so the
+config survives reboots and re-plugging into a different USB port.
 """
 
+import glob
 import json
+import os
 import time
-from pathlib import Path
 
-import cv2
-import serial.tools.list_ports
-
-DEVICE_CONFIG_FILE = "device_config.json"
+import config
 
 
-def _list_ports() -> set:
-    return {p.device for p in serial.tools.list_ports.comports()}
+def serial_ports() -> set:
+    by_id = set(glob.glob("/dev/serial/by-id/*"))
+    return by_id or set(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*"))
 
 
 def find_robot_port() -> str:
-    print("\n=== Robot Arm Port Detection ===")
-    input("Step 1. Unplug the SO-101 USB; press <ENTER> when done...")
-    before = _list_ports()
-    input("Step 2. Plug it back in; press <ENTER> when done...")
+    print("\n=== Robot arm ===")
+    ports = serial_ports()
+    if len(ports) == 1:
+        port = ports.pop()
+        print(f"  Found one serial device: {port}")
+        return port
+    input("  Unplug the arm's USB cable, then press ENTER...")
+    before = serial_ports()
+    input("  Plug it back in (a USB-A port), then press ENTER...")
     time.sleep(1.5)
-    new = _list_ports() - before
-
+    new = serial_ports() - before
     if len(new) == 1:
         port = new.pop()
-        print(f"  -> Detected robot arm on {port}")
+        print(f"  -> {port}")
         return port
-    if not new:
-        print("  No new port detected. Available ports:")
-        for p in serial.tools.list_ports.comports():
-            print(f"    {p.device}: {p.description}")
-        return input("  Enter port manually (e.g. COM3): ").strip()
-    print(f"  Multiple new ports detected: {sorted(new)}")
-    return input("  Enter the port to use: ").strip()
+    print("  Could not identify the arm automatically.")
+    print("  Note: the Jetson's USB-C port is device-only - use a USB-A port.")
+    print("  Present:", sorted(serial_ports()) or "none")
+    return input("  Enter the port manually: ").strip()
 
 
-def _preview_camera(idx: int) -> bool:
-    cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        return False
-    print(f"  Previewing camera {idx} - <S> to select, any other key to skip.")
-    selected = False
-    try:
-        while True:
-            ret, frame = cap.read()
-            if ret:
-                cv2.imshow(f"Camera {idx}", frame)
-            k = cv2.waitKey(30) & 0xFF
-            if k in (ord('s'), ord('S')):
-                selected = True
-                break
-            if k != 255:
-                break
-            if cv2.getWindowProperty(f"Camera {idx}", cv2.WND_PROP_VISIBLE) < 1:
-                break
-    finally:
+def find_camera() -> str:
+    import cv2
+    print("\n=== Camera ===")
+    cams = sorted(p for p in glob.glob("/dev/v4l/by-id/*") if p.endswith("index0"))
+    cams = cams or sorted(glob.glob("/dev/video*"))
+    good = []
+    for c in cams:
+        cap = cv2.VideoCapture(c, cv2.CAP_V4L2)
+        ok, frame = cap.read() if cap.isOpened() else (False, None)
         cap.release()
-        cv2.destroyAllWindows()
-    return selected
-
-
-def find_camera_id() -> int:
-    print("\n=== Camera Detection ===")
-    candidates = []
-    for idx in range(6):
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-        if cap.isOpened():
-            ret, frame = cap.read()
-            if ret and frame is not None:
-                h, w = frame.shape[:2]
-                print(f"  Camera {idx}: OK ({w}x{h})")
-                candidates.append(idx)
-            cap.release()
-
-    if not candidates:
-        return int(input("  No cameras found. Enter index manually: "))
-    if len(candidates) == 1:
-        print(f"  Only one camera available: index {candidates[0]}")
-        return candidates[0]
-    for idx in candidates:
-        if _preview_camera(idx):
-            return idx
-    print(f"  No camera selected, defaulting to {candidates[0]}")
-    return candidates[0]
+        if ok:
+            print(f"  [{len(good)}] {c}  {frame.shape[1]}x{frame.shape[0]}")
+            good.append(c)
+    if not good:
+        raise SystemExit("  No working camera found.")
+    if len(good) == 1:
+        return good[0]
+    i = input(f"  Which camera looks down at the board? [0-{len(good) - 1}]: ").strip()
+    return good[int(i or 0)]
 
 
 def main() -> None:
-    config = {}
-    if Path(DEVICE_CONFIG_FILE).exists():
-        with open(DEVICE_CONFIG_FILE) as f:
-            config = json.load(f)
-        print(f"Existing config: {config}")
-
-    config["robot_port"] = find_robot_port()
-    config["camera_id"] = find_camera_id()
-
-    with open(DEVICE_CONFIG_FILE, "w") as f:
-        json.dump(config, f, indent=2)
-    print(f"\nSaved to {DEVICE_CONFIG_FILE}: {config}")
+    cfg = {}
+    if config.DEVICE_CONFIG_FILE.exists():
+        cfg = json.loads(config.DEVICE_CONFIG_FILE.read_text())
+        print(f"Existing config: {cfg}")
+    cfg["camera"] = find_camera()
+    cfg["robot_port"] = find_robot_port()
+    if not os.access(cfg["robot_port"], os.R_OK | os.W_OK):
+        print("\n  WARNING: no permission for the serial port. Run once:\n"
+              "    sudo usermod -aG dialout $USER     (then log out and back in)")
+    config.DEVICE_CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    print(f"\nSaved {config.DEVICE_CONFIG_FILE.name}: {cfg}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Name=DOROTHY chess robot kiosk
+Comment=Copy to ~/.config/autostart/ to start the kiosk on login
+Exec=/home/dh/Projects/dorothy/run_kiosk.sh
+X-GNOME-Autostart-enabled=true

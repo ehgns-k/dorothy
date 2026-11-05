@@ -1,784 +1,671 @@
 """
-Exhibition kiosk front-end for the chess robot.
+Exhibition front-end: a full-screen, touch-friendly display for the chess
+robot. All game logic lives in game.Controller (worker thread); this file
+only draws `controller.view` and forwards button presses / keys.
 
-A full-screen, touch/keyboard GUI meant to run unattended on a dedicated
-laptop. It REUSES the existing framework unchanged - ChessVision /
-RobotMotion from module.py and the move-inference logic from main.py - and
-adds a hardened game loop on top:
+    python kiosk.py                 # real hardware, full screen
+    python kiosk.py --sim           # no hardware: simulated camera + arm
+    python kiosk.py --windowed      # not full screen
 
-  * All blocking hardware work runs on a background worker thread so the UI
-    never freezes; the worker talks to Tk via queues + root.after().
-  * Camera, serial (arm) and engine failures are caught and recovered with
-    on-screen "please wait / attendant" overlays instead of crashing.
-  * Any unhandled error parks the arm, is logged to kiosk.log, and offers a
-    Restart button - the kiosk is designed to never need a console.
-  * Sabotage hardening: window close disabled, full-screen + always-on-top,
-    unbound keys do nothing, operator-only exit / new-game shortcuts.
-
-Pre-requisites (set up ONCE by the team, then frozen):
-    device_config.json   (python find_port.py)
-    calibration.json     (python calibration.py)
-
-Public controls:
-    SPACE / ENTER ........ "I've moved" / proceed / start
-    number keys 1-9 ...... pick a move / promotion piece (big buttons too)
-Operator controls (hidden):
-    Ctrl+Shift+N ......... force a new game
-    Ctrl+Shift+Q ......... quit the kiosk
-    F11 .................. toggle full-screen
-
-Launch with pythonw.exe for a console-less kiosk:
-    pythonw kiosk.py
+Visitor keys:   arrows / Tab / h j k l = move between buttons,
+                Enter / Space = press the highlighted button, 1-9 = choice buttons
+Operator keys:  Ctrl+Shift+Q quit,  Ctrl+Shift+N new game,  F11 full screen
 """
 
-import os
-import sys
-import json
-import time
-import queue
+import argparse
+import atexit
 import logging
+import logging.handlers
+import math
+import os
+import signal
+import sys
 import threading
-from pathlib import Path
-
+import time
 import tkinter as tk
+from tkinter import font as tkfont
 
 import chess
-import chess.engine
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
-# Importing these does NOT modify the originals; module.py installs the
-# chesscog sys.path shim on import, so the chesscog imports below resolve.
-from module import ChessVision, RobotMotion, DEVICE_CONFIG_FILE, OCCUPANCY_THRESHOLD
-from main import (
-    infer_move_candidates,
-    ROBOT_COLOR,
-    ENGINE_PATH,
-    ENGINE_THINK_TIME_S,
-    DETECTION_ITERATIONS,
-)
-from chesscog.corner_detection import find_corners
-from recap import CfgNode as CN
+import config
+from game import Controller, View
 
-
-# --------------------------------------------------------------------------- #
-# Configuration / appearance
-# --------------------------------------------------------------------------- #
-HERE = Path(__file__).resolve().parent
-LOG_FILE = HERE / "kiosk.log"
-# Written on a deliberate operator quit so game.bat can tell an intentional
-# shutdown (stop relaunching) from a crash / killed window (relaunch).
-STOP_SENTINEL = HERE / "kiosk.stop"
-
-UI_POLL_MS = 50                 # how often Tk drains worker->UI messages
-GAMEOVER_AUTORESET_S = 90       # auto-start a new game this long after game over
-CAMERA_FAILS_BEFORE_RECOVER = 3 # consecutive read failures -> rebuild camera
-
-BG = "#1b1b1b"
-PANEL_BG = "#1b1b1b"
-TITLE_FG = "#ffffff"
-SUB_FG = "#bdbdbd"
-LIGHT_SQ = "#eeeed2"
-DARK_SQ = "#6f9f57"
-LIGHT_HL = "#f6f669"
-DARK_HL = "#b9ca43"
-WHITE_PIECE = "#ffffff"
-BLACK_PIECE = "#1c1c1c"
-LABEL_FG = "#3d4a32"
-
-BTN_BG = "#3a7bd5"
-BTN_FG = "#ffffff"
-BTN_ACTIVE = "#5a93e0"
-OVERLAY_BG = "#101010"
-
-TITLE_FONT = ("Segoe UI", 30, "bold")
-SUB_FONT = ("Segoe UI", 18)
-BTN_FONT = ("Segoe UI", 20, "bold")
-PIECE_FONT_NAME = "Segoe UI Symbol"
-
-PIECE_GLYPH = {
-    chess.PAWN: "♟", chess.KNIGHT: "♞", chess.BISHOP: "♝",
-    chess.ROOK: "♜", chess.QUEEN: "♛", chess.KING: "♚",
-}
-PROMO_BY_NUMBER = {1: chess.QUEEN, 2: chess.ROOK, 3: chess.BISHOP, 4: chess.KNIGHT}
-
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    handlers=[logging.FileHandler(LOG_FILE, encoding="utf-8"),
-              logging.StreamHandler()],
-)
 log = logging.getLogger("kiosk")
 
+# --------------------------------------------------------------------------- #
+# Theme
+# --------------------------------------------------------------------------- #
+BG = "#0e131c"
+PANEL = "#161d29"
+PANEL_2 = "#1d2635"
+TEXT = "#f2f5fa"
+MUTED = "#9aa7bb"
+ACCENT = "#4da3ff"
+FOCUS = "#ffd166"                 # keyboard-focus ring
+TONES = {"info": "#4da3ff", "good": "#3ccf8e", "warn": "#ffb547",
+         "error": "#ff5d5d", "robot": "#b58cff"}
+BTN = {"primary": ("#4da3ff", "#0b1220", "#7dbcff"),
+       "secondary": ("#2a3547", TEXT, "#38465e"),
+       "danger": ("#ff5d5d", "#1a0b0b", "#ff8080"),
+       "choice": ("#2a3547", TEXT, "#38465e"),
+       "choice-on": ("#3ccf8e", "#0b1a12", "#62e0a8")}
 
-class OperatorQuit(Exception):
-    """Raised anywhere in the worker to tear down and exit the kiosk."""
+LIGHT_SQ = (238, 220, 186)
+DARK_SQ = (174, 128, 92)
+HL_RGBA = {"last": (255, 225, 80, 110), "detect": (77, 163, 255, 150),
+           "problem": (255, 70, 70, 165), "help": (255, 170, 40, 170),
+           "check": (255, 40, 40, 150)}
+GLYPH = {chess.KING: "♚", chess.QUEEN: "♛", chess.ROOK: "♜",
+         chess.BISHOP: "♝", chess.KNIGHT: "♞", chess.PAWN: "♟"}
+UI_FONT = "Ubuntu"
+PIECE_FONT_FILE = "DejaVuSans.ttf"
+COORD_FONT_FILE = "DejaVuSans-Bold.ttf"
 
 
-class NewGameRequest(Exception):
-    """Raised in the worker to abandon the current game and reset."""
+def _font_family(root) -> str:
+    fams = set(tkfont.families(root))
+    for f in (UI_FONT, "Noto Sans", "DejaVu Sans"):
+        if f in fams:
+            return f
+    return "TkDefaultFont"
 
 
 # --------------------------------------------------------------------------- #
-# Kiosk application
+# Board renderer (PIL, anti-aliased)
 # --------------------------------------------------------------------------- #
-class KioskApp:
-    def __init__(self) -> None:
-        self.human_color = not ROBOT_COLOR
-        self.human_white = (self.human_color == chess.WHITE)
+class BoardRenderer:
+    def __init__(self):
+        self._fonts = {}
 
-        # Hardware handles (created by the worker during init).
-        self.vision = None
-        self.motion = None
-        self.engine = None
-        self.corner_cfg = None
-        self.camera_id = None
-        self.robot_port = None
-        self.last_threshold = OCCUPANCY_THRESHOLD
-        self._camera_fail_count = 0
+    def _font(self, file, size):
+        key = (file, size)
+        if key not in self._fonts:
+            try:
+                self._fonts[key] = ImageFont.truetype(file, size)
+            except OSError:
+                self._fonts[key] = ImageFont.load_default()
+        return self._fonts[key]
 
-        # Worker <-> UI plumbing.
-        self.ui_q: "queue.Queue" = queue.Queue()       # worker -> UI callables
-        self.action_q: "queue.Queue" = queue.Queue()   # UI -> worker (confirm/number)
-        self._quit_evt = threading.Event()             # operator quit
-        self._newgame_evt = threading.Event()          # operator/public new game
+    def render(self, v: View, size: int, white_bottom: bool, selected=None) -> Image.Image:
+        sq = size / 8
+        img = Image.new("RGB", (size, size), DARK_SQ)
+        d = ImageDraw.Draw(img)
 
-        self._cur_fen = chess.Board().fen()
-        self._cur_last = None
-        self._fullscreen = True
+        def xy(s):
+            f, r = chess.square_file(s), chess.square_rank(s)
+            c, row = (f, 7 - r) if white_bottom else (7 - f, r)
+            return c * sq, row * sq
 
-        self._build_ui()
+        for s in chess.SQUARES:
+            x, y = xy(s)
+            light = (chess.square_file(s) + chess.square_rank(s)) % 2 == 1
+            d.rectangle([x, y, x + sq, y + sq], fill=LIGHT_SQ if light else DARK_SQ)
 
-    # ----- UI construction ------------------------------------------------- #
-    def _build_ui(self) -> None:
+        layer = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        ld = ImageDraw.Draw(layer)
+        marks = {}
+        if v.last_move:
+            mv = chess.Move.from_uci(v.last_move)
+            marks[mv.from_square] = marks[mv.to_square] = "last"
+        marks.update(dict(v.highlights))
+        if selected is not None:
+            marks[selected] = "detect"
+        for s, kind in marks.items():
+            x, y = xy(s)
+            col = HL_RGBA.get(kind, HL_RGBA["detect"])
+            if kind in ("problem", "help"):
+                w = max(4, int(sq * 0.08))
+                ld.rectangle([x + w / 2, y + w / 2, x + sq - w / 2, y + sq - w / 2],
+                             outline=col[:3] + (255,), width=w)
+                ld.rectangle([x, y, x + sq, y + sq], fill=col[:3] + (70,))
+            elif kind == "check":
+                ld.ellipse([x + sq * 0.05, y + sq * 0.05, x + sq * 0.95, y + sq * 0.95], fill=col)
+            else:
+                ld.rectangle([x, y, x + sq, y + sq], fill=col)
+        img.paste(layer, (0, 0), layer)
+
+        # coordinates
+        cf = self._font(COORD_FONT_FILE, max(10, int(sq * 0.15)))
+        for i in range(8):
+            f = i if white_bottom else 7 - i
+            r = 7 - i if white_bottom else i
+            light_bottom = (f + (0 if white_bottom else 7)) % 2 == 1
+            d.text((i * sq + sq - 4, size - 3), "abcdefgh"[f], font=cf, anchor="rd",
+                   fill=DARK_SQ if light_bottom else LIGHT_SQ)
+            d.text((4, i * sq + 3), str(r + 1), font=cf, anchor="lt",
+                   fill=DARK_SQ if (0 if white_bottom else 7) % 2 == r % 2 else LIGHT_SQ)
+
+        # pieces
+        board = chess.Board(v.fen)
+        pf = self._font(PIECE_FONT_FILE, int(sq * 0.80))
+        stroke = max(2, int(sq * 0.035))
+        for s, p in board.piece_map().items():
+            x, y = xy(s)
+            cx, cy = x + sq / 2, y + sq / 2 + sq * 0.03
+            g = GLYPH[p.piece_type]
+            if p.color == chess.WHITE:
+                d.text((cx + 2, cy + 3), g, font=pf, anchor="mm", fill=(0, 0, 0, 80))
+                d.text((cx, cy), g, font=pf, anchor="mm", fill=(250, 250, 248),
+                       stroke_width=stroke, stroke_fill=(40, 34, 30))
+            else:
+                d.text((cx + 2, cy + 3), g, font=pf, anchor="mm", fill=(0, 0, 0, 80))
+                d.text((cx, cy), g, font=pf, anchor="mm", fill=(28, 26, 26),
+                       stroke_width=stroke, stroke_fill=(235, 230, 220))
+
+        # arrow (robot's move / detected move)
+        if v.arrow:
+            a = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            ad = ImageDraw.Draw(a)
+            (x0, y0), (x1, y1) = xy(v.arrow[0]), xy(v.arrow[1])
+            x0, y0, x1, y1 = x0 + sq / 2, y0 + sq / 2, x1 + sq / 2, y1 + sq / 2
+            ang = math.atan2(y1 - y0, x1 - x0)
+            head = sq * 0.42
+            ex, ey = x1 - math.cos(ang) * head * 0.9, y1 - math.sin(ang) * head * 0.9
+            col = (181, 140, 255, 200) if v.tone == "robot" else (77, 163, 255, 200)
+            ad.line([x0, y0, ex, ey], fill=col, width=int(sq * 0.16))
+            pts = [(x1, y1),
+                   (x1 - head * math.cos(ang - 0.5), y1 - head * math.sin(ang - 0.5)),
+                   (x1 - head * math.cos(ang + 0.5), y1 - head * math.sin(ang + 0.5))]
+            ad.polygon(pts, fill=col)
+            img.paste(a, (0, 0), a)
+        return img
+
+
+# --------------------------------------------------------------------------- #
+# Kiosk window
+# --------------------------------------------------------------------------- #
+class Kiosk:
+    def __init__(self, controller: Controller, fullscreen: bool):
+        self.c = controller
         self.root = tk.Tk()
-        self.root.title("Chess Robot")
+        self.root.title(config.TITLE)
         self.root.configure(bg=BG)
-        self.root.attributes("-fullscreen", True)
-        self.root.attributes("-topmost", True)
-        # Closing the window is disabled; operators use Ctrl+Shift+Q.
-        self.root.protocol("WM_DELETE_WINDOW", lambda: None)
+        self.fullscreen = fullscreen
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        if fullscreen:
+            self.root.attributes("-fullscreen", True)
+            self.W, self.H = sw, sh
+        else:
+            self.W, self.H = min(1600, sw - 80), min(900, sh - 100)
+            self.root.geometry(f"{self.W}x{self.H}+40+40")
+        self.root.protocol("WM_DELETE_WINDOW", lambda: None)  # visitors can't close it
+        self.k = min(self.W / 1920, self.H / 1080)
+        self.fam = _font_family(self.root)
+        self.renderer = BoardRenderer()
+        self.white_bottom = controller.robot_color == chess.BLACK
+        self._shown = None
+        self._board_key = None
+        self._buttons_key = None
+        self._overlay_key = None
+        self._main_buttons: list = []
+        self._ov_buttons: list = []
+        self._focus = 0
+        self._want_focus = None
+        self._board_photo = self._cam_photo = None
+        self._selected = None
+        self._last_preview = 0.0
+        self._build()
+        self._bind_keys()
 
-        # Top status banner.
-        status = tk.Frame(self.root, bg=PANEL_BG)
-        status.pack(side="top", fill="x", padx=24, pady=(18, 6))
-        self.title_var = tk.StringVar(value="Starting up...")
-        self.sub_var = tk.StringVar(value="Please wait")
-        tk.Label(status, textvariable=self.title_var, bg=PANEL_BG, fg=TITLE_FG,
-                 font=TITLE_FONT).pack(anchor="center")
-        tk.Label(status, textvariable=self.sub_var, bg=PANEL_BG, fg=SUB_FG,
-                 font=SUB_FONT, wraplength=1100, justify="center").pack(anchor="center")
+    def F(self, size, weight="normal"):
+        return (self.fam, max(8, int(size * self.k)), weight)
 
-        # Action buttons (rebuilt per prompt).
-        self.action_frame = tk.Frame(self.root, bg=PANEL_BG)
-        self.action_frame.pack(side="bottom", fill="x", pady=(6, 24))
+    def P(self, px):
+        return max(1, int(px * self.k))
 
-        # Board canvas (fills the middle, redraws on resize).
-        self.canvas = tk.Canvas(self.root, bg=BG, highlightthickness=0)
-        self.canvas.pack(side="top", fill="both", expand=True)
-        self.canvas.bind("<Configure>", lambda e: self._draw_board(self._cur_fen, self._cur_last))
+    # ---- layout -------------------------------------------------------- #
+    def _build(self) -> None:
+        P = self.P
+        margin = P(48)
+        self.board_px = int(min(self.H - 2 * margin, self.W * 0.52))
+        left = tk.Frame(self.root, bg=BG)
+        left.pack(side="left", fill="y", padx=(margin, P(24)), pady=margin)
 
-        # Full-screen overlay for setup/errors (hidden until needed).
-        self.overlay = tk.Frame(self.root, bg=OVERLAY_BG)
-        self.ov_title = tk.StringVar()
-        self.ov_msg = tk.StringVar()
-        tk.Label(self.overlay, textvariable=self.ov_title, bg=OVERLAY_BG,
-                 fg=TITLE_FG, font=TITLE_FONT).pack(pady=(140, 18))
-        tk.Label(self.overlay, textvariable=self.ov_msg, bg=OVERLAY_BG, fg=SUB_FG,
-                 font=SUB_FONT, wraplength=1000, justify="center").pack(pady=10)
-        self.ov_buttons = tk.Frame(self.overlay, bg=OVERLAY_BG)
-        self.ov_buttons.pack(pady=30)
+        self.eval_canvas = tk.Canvas(left, width=P(26), height=self.board_px, bg=BG,
+                                     highlightthickness=0)
+        self.eval_canvas.pack(side="left", padx=(0, P(14)))
+        self.board_canvas = tk.Canvas(left, width=self.board_px, height=self.board_px,
+                                      bg=BG, highlightthickness=0)
+        self.board_canvas.pack(side="left")
+        self.board_canvas.bind("<Button-1>", self._on_board_click)
 
-        # Key bindings.
-        self.root.bind("<space>", lambda e: self._push("confirm"))
-        self.root.bind("<Return>", lambda e: self._push("confirm"))
+        right = tk.Frame(self.root, bg=BG)
+        right.pack(side="left", fill="both", expand=True, padx=(P(24), margin), pady=margin)
+        self.right = right
+        self.right_w = self.W - self.board_px - P(26) - P(14) - 2 * margin - 2 * P(24)
+        wrap = self.right_w - P(90)
+
+        # header
+        head = tk.Frame(right, bg=BG)
+        head.pack(fill="x")
+        tk.Label(head, text=config.TITLE, font=self.F(54, "bold"), fg=TEXT, bg=BG
+                 ).pack(side="left")
+        tk.Label(right, text=config.SUBTITLE, font=self.F(22), fg=MUTED, bg=BG, anchor="w"
+                 ).pack(fill="x")
+        self.info_lbl = tk.Label(right, text="", font=self.F(16), fg=MUTED, bg=BG, anchor="w",
+                                 justify="left", wraplength=wrap)
+        self.info_lbl.pack(fill="x")
+
+        # status card
+        card = tk.Frame(right, bg=PANEL)
+        card.pack(fill="x", pady=(P(26), P(18)))
+        self.accent = tk.Frame(card, bg=ACCENT, width=P(10))
+        self.accent.pack(side="left", fill="y")
+        body = tk.Frame(card, bg=PANEL)
+        body.pack(side="left", fill="both", expand=True, padx=P(30), pady=P(24))
+        self.headline = tk.Label(body, text="", font=self.F(44, "bold"), fg=TEXT, bg=PANEL,
+                                 anchor="w", justify="left", wraplength=wrap)
+        self.headline.pack(fill="x")
+        self.detail = tk.Label(body, text="", font=self.F(23), fg=MUTED, bg=PANEL,
+                               anchor="w", justify="left", wraplength=wrap)
+        self.detail.pack(fill="x", pady=(P(8), 0))
+        self.progress = tk.Canvas(body, height=P(8), bg=PANEL_2, highlightthickness=0)
+        self.progress.pack(fill="x", pady=(P(18), 0))
+        self.btn_row = tk.Frame(body, bg=PANEL)
+        self.btn_row.pack(fill="x", pady=(P(20), 0))
+
+        # bottom: camera + move list
+        bottom = tk.Frame(right, bg=BG)
+        bottom.pack(fill="both", expand=True)
+        cam = tk.Frame(bottom, bg=PANEL)
+        cam.pack(side="left", fill="both", expand=True)
+        cam_head = tk.Frame(cam, bg=PANEL)
+        cam_head.pack(fill="x", padx=P(20), pady=(P(14), P(6)))
+        tk.Label(cam_head, text="WHAT THE ROBOT SEES", font=self.F(14, "bold"), fg=MUTED,
+                 bg=PANEL).pack(side="left")
+        self.cam_state = tk.Label(cam_head, text="", font=self.F(14, "bold"), fg=TONES["good"],
+                                  bg=PANEL)
+        self.cam_state.pack(side="right")
+        self.cam_lbl = tk.Label(cam, bg=PANEL)
+        self.cam_lbl.pack(expand=True, padx=P(14), pady=(0, P(14)))
+        self.cam_size = (P(460), P(330))
+
+        moves = tk.Frame(bottom, bg=PANEL, width=P(300))
+        moves.pack(side="left", fill="y", padx=(P(18), 0))
+        moves.pack_propagate(False)
+        tk.Label(moves, text="MOVES", font=self.F(14, "bold"), fg=MUTED, bg=PANEL
+                 ).pack(anchor="w", padx=P(20), pady=(P(14), P(6)))
+        self.moves_lbl = tk.Label(moves, text="", font=(self._mono(), max(8, int(19 * self.k))),
+                                  fg=TEXT, bg=PANEL, justify="left", anchor="nw")
+        self.moves_lbl.pack(fill="both", expand=True, padx=P(20))
+
+        # overlay for errors / attendant messages
+        self.overlay = tk.Frame(self.root, bg="#0a0d13")
+        self.ov_title = tk.Label(self.overlay, font=self.F(46, "bold"), fg=TEXT, bg="#0a0d13")
+        self.ov_title.pack(pady=(self.H * 0.25, P(20)))
+        self.ov_msg = tk.Label(self.overlay, font=self.F(24), fg=MUTED, bg="#0a0d13",
+                               wraplength=self.W * 0.6, justify="center")
+        self.ov_msg.pack()
+        self.ov_btns = tk.Frame(self.overlay, bg="#0a0d13")
+        self.ov_btns.pack(pady=P(40))
+
+    def _mono(self):
+        fams = set(tkfont.families(self.root))
+        for f in ("Ubuntu Mono", "DejaVu Sans Mono"):
+            if f in fams:
+                return f
+        return "TkFixedFont"
+
+    def _bind_keys(self) -> None:
+        r = self.root
+        r.bind("<space>", lambda e: self._activate_focused())
+        r.bind("<Return>", lambda e: self._activate_focused())
+        r.bind("<KP_Enter>", lambda e: self._activate_focused())
+        for k in ("<Left>", "<Up>", "h", "k", "<ISO_Left_Tab>", "<Shift-Tab>"):
+            r.bind(k, lambda e: self._move_focus(-1))
+        for k in ("<Right>", "<Down>", "l", "j", "<Tab>"):
+            r.bind(k, lambda e: self._move_focus(+1))
         for n in range(1, 10):
-            self.root.bind(str(n), lambda e, num=n: self._push("number", num))
-        self.root.bind("<Control-Shift-Q>", lambda e: self._push("quit"))
-        self.root.bind("<Control-Shift-N>", lambda e: self._push("newgame"))
-        self.root.bind("<F11>", lambda e: self._toggle_fullscreen())
+            r.bind(str(n), lambda e, n=n: self._key(str(n)))
+        # Ctrl+Shift+Q / Ctrl+Shift+N, whatever Caps Lock or the layout says
+        r.bind("<Control-KeyPress>", self._control_key)
+        r.bind("<F11>", lambda e: self._toggle_fullscreen())
 
-        self._draw_board(self._cur_fen, self._cur_last)
+    def _toggle_fullscreen(self):
+        self.fullscreen = not self.fullscreen
+        self.root.attributes("-fullscreen", self.fullscreen)
 
-    def _toggle_fullscreen(self) -> None:
-        self._fullscreen = not self._fullscreen
-        self.root.attributes("-fullscreen", self._fullscreen)
+    def _control_key(self, e) -> str:
+        if not e.state & 0x1:          # Shift must be held
+            return ""
+        k = (e.keysym or "").lower()
+        if k == "q":
+            self._operator_quit()
+            return "break"
+        if k == "n":
+            self.c.send("newgame")
+            return "break"
+        return ""
 
-    # ----- thread-safe UI helpers (called from the worker) ----------------- #
-    def _post(self, fn) -> None:
-        self.ui_q.put(fn)
-
-    def _drain_ui(self) -> None:
+    def _operator_quit(self):
+        """Ctrl+Shift+Q: always closes within a few seconds, whatever the
+        game is busy with (robot move, engine, board search...)."""
+        if getattr(self, "_quitting", False):
+            return
+        self._quitting = True
         try:
-            while True:
-                fn = self.ui_q.get_nowait()
-                try:
-                    fn()
-                except Exception:
-                    log.exception("UI callback failed")
-        except queue.Empty:
+            config.STOP_SENTINEL.write_text(time.strftime("%F %T"))
+        except Exception:
             pass
-        self.root.after(UI_POLL_MS, self._drain_ui)
+        log.info("operator quit requested")
+        self.c.request_quit()
+        self.ov_title.configure(text="Shutting down")
+        self.ov_msg.configure(text="Stopping the robot...")
+        for ch in self.ov_btns.winfo_children():
+            ch.destroy()
+        self.overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
+        self.overlay.lift()
+        deadline = time.time() + 4.0
 
-    def _status(self, title: str, sub: str = "") -> None:
-        def apply():
-            self.title_var.set(title)
-            self.sub_var.set(sub)
-        self._post(apply)
+        def wait_worker():
+            w = getattr(self.c, "worker", None)
+            if w is None or not w.is_alive() or time.time() > deadline:
+                self.root.quit()       # main() then parks (if safe) and goes limp
+            else:
+                self.root.after(100, wait_worker)
+        self.root.after(100, wait_worker)
 
-    def _render(self, board: chess.Board) -> None:
-        fen = board.fen()
-        last = board.peek().uci() if board.move_stack else None
-        self._post(lambda: self._draw_board(fen, last))
+    def _key(self, key: str) -> None:
+        for b in self.c.view.buttons:
+            if b.key == key:
+                self._press(b)
+                return
 
-    def _actions(self, specs: list) -> None:
-        """specs: list of (label, kind, value). Built on the UI thread."""
-        self._post(lambda: self._build_actions(specs))
+    # ---- keyboard focus ------------------------------------------------ #
+    def _active_buttons(self):
+        return self._ov_buttons if self.overlay.winfo_ismapped() else self._main_buttons
 
-    def _build_actions(self, specs: list) -> None:
-        for child in self.action_frame.winfo_children():
-            child.destroy()
-        inner = tk.Frame(self.action_frame, bg=PANEL_BG)
-        inner.pack(anchor="center")
-        for label, kind, value in specs:
-            tk.Button(inner, text=label, font=BTN_FONT, bg=BTN_BG, fg=BTN_FG,
-                      activebackground=BTN_ACTIVE, activeforeground=BTN_FG,
-                      relief="flat", padx=26, pady=14, borderwidth=0,
-                      command=lambda k=kind, v=value: self._push(k, v)
-                      ).pack(side="left", padx=10)
+    def _nav_buttons(self):
+        """Buttons the arrow keys cycle through. On the start screen that is
+        ONLY the difficulty choices - Enter/Space always starts the game."""
+        btns = self._active_buttons()
+        diff = [bw for bw in btns if bw[0].action == "difficulty"]
+        return diff or btns
 
-    def _overlay_show(self, title: str, msg: str, specs: list) -> None:
-        def apply():
-            self.ov_title.set(title)
-            self.ov_msg.set(msg)
-            for child in self.ov_buttons.winfo_children():
-                child.destroy()
-            for label, kind, value in specs:
-                tk.Button(self.ov_buttons, text=label, font=BTN_FONT, bg=BTN_BG,
-                          fg=BTN_FG, activebackground=BTN_ACTIVE,
-                          activeforeground=BTN_FG, relief="flat", padx=26, pady=14,
-                          borderwidth=0,
-                          command=lambda k=kind, v=value: self._push(k, v)
-                          ).pack(side="left", padx=10)
+    def _press(self, b) -> None:
+        self._want_focus = (b.action, b.value)
+        self.c.send(b.action, b.value)
+
+    def _activate_focused(self) -> str:
+        nav = self._nav_buttons()
+        if nav and nav[0][0].action == "difficulty":
+            self._key("Space")             # start screen: Enter = Start game
+        elif nav:
+            self._press(nav[self._focus % len(nav)][0])
+        else:
+            self._key("Space")
+        return "break"
+
+    def _move_focus(self, step: int) -> str:
+        nav = self._nav_buttons()
+        if nav:
+            self._focus = (self._focus + step) % len(nav)
+            b = nav[self._focus][0]
+            self._want_focus = (b.action, b.value)
+            if b.action == "difficulty":   # moving IS choosing on the start screen
+                self.c.send(b.action, b.value)
+            self._draw_focus()
+        return "break"  # keep Tk's own Tab traversal out of it
+
+    def _restore_focus(self) -> None:
+        nav = self._nav_buttons()
+        idx = None
+        if self._want_focus is not None:
+            idx = next((i for i, (b, _) in enumerate(nav)
+                        if (b.action, b.value) == self._want_focus), None)
+        if idx is None:  # default: the selected choice, else the main (Space) button
+            idx = next((i for i, (b, _) in enumerate(nav) if b.style == "choice-on"), None)
+        if idx is None:
+            idx = next((i for i, (b, _) in enumerate(nav) if b.key == "Space"), 0)
+        self._focus = idx
+        self._draw_focus()
+
+    def _draw_focus(self) -> None:
+        nav = self._nav_buttons()
+        focused = nav[self._focus % len(nav)][1] if nav else None
+        for lst in (self._main_buttons, self._ov_buttons):
+            for b, w in lst:
+                on = w is focused
+                bg = w.master.cget("bg")
+                w.configure(highlightbackground=FOCUS if on else bg,
+                            highlightcolor=FOCUS if on else bg)
+
+    # ---- simulation: click the board to move pieces physically -------- #
+    def _on_board_click(self, e) -> None:
+        if not self.c.sim or self.c.world is None:
+            return
+        sq = self.board_px / 8
+        col, row = int(e.x // sq), int(e.y // sq)
+        if not (0 <= col < 8 and 0 <= row < 8):
+            return
+        f, r = (col, 7 - row) if self.white_bottom else (7 - col, row)
+        s = chess.square(f, r)
+        if self._selected is None:
+            if s in self.c.world.pieces:
+                self._selected = s
+        else:
+            if s != self._selected:
+                self.c.world.human_move(self._selected, s)
+            self._selected = None
+        self._board_key = None
+
+    # ---- refresh loop -------------------------------------------------- #
+    def _refresh(self) -> None:
+        try:
+            v = self.c.view
+            if v.phase == "exit":
+                self.root.quit()
+                return
+            if getattr(self, "_quitting", False):
+                pass  # keep the "Shutting down" overlay; the camera keeps updating
+            elif self._shown is None or v.version != self._shown.version:
+                self._apply(v)
+                self._shown = v
+            now = time.time()
+            if self._shown is not None and self._shown.busy:
+                self._draw_busy(now)
+            if now - self._last_preview >= 1.0 / config.CAMERA_PREVIEW_FPS:
+                self._last_preview = now
+                self._update_camera(v)
+        except Exception:
+            log.exception("UI refresh failed")
+        self.root.after(40, self._refresh)
+
+    def _apply(self, v: View) -> None:
+        tone = TONES.get(v.tone, ACCENT)
+        self.accent.configure(bg=tone)
+        self.headline.configure(text=v.headline)
+        self.detail.configure(text=v.detail)
+        info = []
+        if v.difficulty:
+            info.append(f"Level: {v.difficulty}")
+        info.append("Robot plays " + ("White" if v.robot_white else "Black"))
+        if self.c.sim:
+            info.append("SIMULATION - click pieces on the board to move them")
+        self.info_lbl.configure(text="   •   ".join(info))
+
+        # progress bar (busy: animated in _refresh)
+        self.progress.delete("all")
+        if v.progress is not None and not v.busy:
+            w = self.progress.winfo_width() or 400
+            self.progress.create_rectangle(0, 0, w * max(0.0, min(1.0, v.progress)),
+                                           self.P(8), fill=tone, width=0)
+
+        bkey = (v.fen, v.last_move, v.highlights, v.arrow, v.tone == "robot", self._selected)
+        if bkey != self._board_key:
+            self._board_key = bkey
+            img = self.renderer.render(v, self.board_px, self.white_bottom, self._selected)
+            self._board_photo = ImageTk.PhotoImage(img)
+            self.board_canvas.delete("all")
+            self.board_canvas.create_image(0, 0, image=self._board_photo, anchor="nw")
+            self._draw_eval(v.eval_pawns)
+            self._draw_moves(v.moves_san)
+
+        if v.buttons != self._buttons_key:
+            self._buttons_key = v.buttons
+            self._main_buttons = self._make_buttons(self.btn_row, v.buttons, PANEL)
+
+        overlay_key = (v.overlay, v.buttons)
+        if v.overlay:
+            if overlay_key != self._overlay_key:
+                self.ov_title.configure(text=v.overlay[0])
+                self.ov_msg.configure(text=v.overlay[1])
+                self._ov_buttons = self._make_buttons(self.ov_btns, v.buttons, "#0a0d13")
             self.overlay.place(relx=0, rely=0, relwidth=1, relheight=1)
             self.overlay.lift()
-        self._post(apply)
+        else:
+            self.overlay.place_forget()
+            self._ov_buttons = []
+        self._overlay_key = overlay_key
+        self.root.update_idletasks()
+        self._restore_focus()
 
-    def _overlay_hide(self) -> None:
-        self._post(self.overlay.place_forget)
-
-    # ----- board drawing --------------------------------------------------- #
-    def _draw_board(self, fen: str, last_uci) -> None:
-        c = self.canvas
+    def _draw_busy(self, now: float) -> None:
+        """Sliding bar: the robot is checking something - it isn't frozen."""
+        c = self.progress
         c.delete("all")
-        w = c.winfo_width()
-        h = c.winfo_height()
-        if w < 50 or h < 50:
+        w = c.winfo_width() or 400
+        seg = w * 0.25
+        x = ((now * 0.6) % 1.0) * (w + seg) - seg
+        c.create_rectangle(max(0, x), 0, min(w, x + seg), self.P(8),
+                           fill=TONES.get(self._shown.tone, ACCENT), width=0)
+
+    def _make_buttons(self, parent, buttons, bg) -> list:
+        """Build the buttons; returns [(Button, widget)] in reading order."""
+        for ch in parent.winfo_children():
+            ch.destroy()
+        made = []
+        # choices (difficulty, candidate moves, promotion) on their own row(s)
+        choices = [b for b in buttons if b.style.startswith("choice")]
+        others = [b for b in buttons if not b.style.startswith("choice")]
+        per_row = 2 if self.right_w < self.P(760) else 4
+        rows = [choices[i:i + per_row] for i in range(0, len(choices), per_row)]
+        if others:
+            rows.append(others)
+        for row_buttons in rows:
+            row = tk.Frame(parent, bg=bg)
+            row.pack(anchor="w")
+            made += self._button_row(row, row_buttons)
+        return made
+
+    def _button_row(self, parent, buttons) -> list:
+        made = []
+        for b in buttons:
+            colors = BTN.get(b.style, BTN["primary"])
+            label = b.label
+            if b.key and b.key != "Space" and b.style.startswith("choice"):
+                label = f"{b.key}  {b.label}"
+            w = tk.Button(parent, text=label, font=self.F(22, "bold"), bg=colors[0],
+                          fg=colors[1], activebackground=colors[2],
+                          activeforeground=colors[1], relief="flat", bd=0, takefocus=0,
+                          highlightthickness=self.P(5), highlightbackground=parent.cget("bg"),
+                          highlightcolor=parent.cget("bg"), padx=self.P(30), pady=self.P(16),
+                          cursor="hand2", command=lambda b=b: self._press(b))
+            w.pack(side="left", padx=(0, self.P(14)), pady=self.P(4))
+            made.append((b, w))
+        return made
+
+    def _draw_eval(self, ev) -> None:
+        c = self.eval_canvas
+        c.delete("all")
+        h, w = self.board_px, self.P(26)
+        c.create_rectangle(0, 0, w, h, fill="#2b2b2b", width=0)
+        if ev is None:
             return
-        self._cur_fen, self._cur_last = fen, last_uci
+        frac = 1 / (1 + math.exp(-ev / 2.5))  # white's share
+        if not self.white_bottom:
+            frac = 1 - frac
+        y = h * (1 - frac)
+        c.create_rectangle(0, y, w, h, fill="#f1f1f1", width=0)
+        txt = "M" if abs(ev) >= 99 else f"{abs(ev):.1f}"
+        top_is_white = not self.white_bottom
+        leader_white = ev > 0
+        at_bottom = leader_white != top_is_white
+        c.create_text(w / 2, h - 6 if at_bottom else 6, text=txt, anchor="s" if at_bottom else "n",
+                      font=self.F(11, "bold"), fill="#222" if at_bottom else "#eee")
 
-        margin = 28
-        size = min(w, h) - 2 * margin
-        sq = size / 8.0
-        x0 = (w - size) / 2.0
-        y0 = (h - size) / 2.0
+    def _draw_moves(self, san) -> None:
+        rows = [f"{i // 2 + 1:>3}. {san[i]:<8}{san[i + 1] if i + 1 < len(san) else ''}"
+                for i in range(0, len(san), 2)]
+        self.moves_lbl.configure(text="\n".join(rows[-14:]))
 
-        try:
-            board = chess.Board(fen)
-        except ValueError:
-            board = chess.Board()
-
-        hl = set()
-        if last_uci:
-            try:
-                mv = chess.Move.from_uci(last_uci)
-                hl = {mv.from_square, mv.to_square}
-            except ValueError:
-                hl = set()
-
-        piece_font = (PIECE_FONT_NAME, max(10, int(sq * 0.72)))
-        label_font = ("Segoe UI", max(8, int(sq * 0.16)))
-
-        for square in chess.SQUARES:
-            f = chess.square_file(square)
-            r = chess.square_rank(square)
-            col = f if self.human_white else 7 - f
-            row = (7 - r) if self.human_white else r
-            x = x0 + col * sq
-            y = y0 + row * sq
-            is_light = (f + r) % 2 == 1
-            if square in hl:
-                fill = LIGHT_HL if is_light else DARK_HL
-            else:
-                fill = LIGHT_SQ if is_light else DARK_SQ
-            c.create_rectangle(x, y, x + sq, y + sq, fill=fill, outline=fill)
-
-            # Edge coordinate labels.
-            if row == 7:
-                c.create_text(x + sq - 4, y + sq - 4, anchor="se",
-                              text="abcdefgh"[f], fill=LABEL_FG, font=label_font)
-            if col == 0:
-                c.create_text(x + 4, y + 2, anchor="nw",
-                              text=str(r + 1), fill=LABEL_FG, font=label_font)
-
-        for square in chess.SQUARES:
-            piece = board.piece_at(square)
-            if piece is None:
-                continue
-            f = chess.square_file(square)
-            r = chess.square_rank(square)
-            col = f if self.human_white else 7 - f
-            row = (7 - r) if self.human_white else r
-            cx = x0 + col * sq + sq / 2.0
-            cy = y0 + row * sq + sq / 2.0
-            glyph = PIECE_GLYPH[piece.piece_type]
-            if piece.color == chess.WHITE:
-                fill, outline = WHITE_PIECE, BLACK_PIECE
-            else:
-                fill, outline = BLACK_PIECE, WHITE_PIECE
-            for dx, dy in ((-2, 0), (2, 0), (0, -2), (0, 2),
-                           (-1, -1), (1, 1), (-1, 1), (1, -1)):
-                c.create_text(cx + dx, cy + dy, text=glyph, fill=outline, font=piece_font)
-            c.create_text(cx, cy, text=glyph, fill=fill, font=piece_font)
-
-    # ----- actions / waiting ----------------------------------------------- #
-    def _push(self, kind: str, value=None) -> None:
-        if kind == "quit":
-            self._quit_evt.set()
-        elif kind == "newgame":
-            self._newgame_evt.set()
-        else:
-            self.action_q.put((kind, value))
-
-    def _drain_actions(self) -> None:
-        try:
-            while True:
-                self.action_q.get_nowait()
-        except queue.Empty:
-            pass
-
-    def _await(self, allowed, timeout=None, on_tick=None):
-        """Block the worker until an allowed action arrives.
-
-        `allowed` is a subset of {"confirm", "number", "newgame"}. Operator
-        quit (event) always raises OperatorQuit. Returns (kind, value);
-        ("timeout", None) if `timeout` seconds elapse.
-        """
-        self._drain_actions()
-        deadline = time.time() + timeout if timeout else None
-        while True:
-            if self._quit_evt.is_set():
-                raise OperatorQuit
-            if "newgame" in allowed and self._newgame_evt.is_set():
-                self._newgame_evt.clear()
-                return ("newgame", None)
-            try:
-                kind, value = self.action_q.get(timeout=0.3)
-            except queue.Empty:
-                if deadline:
-                    remaining = max(0, int(round(deadline - time.time())))
-                    if on_tick:
-                        self._post(lambda r=remaining: on_tick(r))
-                    if time.time() >= deadline:
-                        return ("timeout", None)
-                continue
-            if kind in allowed:
-                return (kind, value)
-            # Unexpected action for this prompt: ignore.
-
-    # ----- hardware init & recovery ---------------------------------------- #
-    def _retry(self, fn, label: str):
-        """Run fn(); on failure show a retry overlay and loop. Returns fn()."""
-        while True:
-            try:
-                result = fn()
-                self._overlay_hide()
-                return result
-            except OperatorQuit:
-                raise
-            except Exception as e:
-                log.exception("%s", label)
-                self._overlay_show(
-                    "Setup problem",
-                    f"{label}.\n\n{type(e).__name__}: {e}\n\n"
-                    "An attendant can resolve this, then press Retry.",
-                    [("Retry", "confirm", None), ("Quit", "quit", None)])
-                self._await({"confirm"})
-                self._overlay_hide()
-
-    def _make_motion(self) -> RobotMotion:
-        if self.motion is not None:
-            try:
-                self.motion.disconnect()
-            except Exception:
-                pass
-        motion = RobotMotion(port=self.robot_port)
-        motion.enable_torque()
-        return motion
-
-    def _detect_corners(self) -> None:
-        img = self.vision.capture_image()
-        corners = find_corners(self.corner_cfg, img)
-        self.vision.board_corners = corners
-        log.info("Board corners detected.")
-
-    def _make_vision(self) -> ChessVision:
-        if self.vision is not None:
-            try:
-                self.vision.release()
-            except Exception:
-                pass
-        vision = ChessVision(camera_id=self.camera_id, robot_color=ROBOT_COLOR)
-        vision.occupancy_threshold = self.last_threshold
-        return vision
-
-    def _init_hardware(self) -> None:
-        self._status("Starting up...", "Loading configuration")
-        cfg_path = HERE / DEVICE_CONFIG_FILE
-        if not cfg_path.exists():
-            self._overlay_show(
-                "Configuration missing",
-                f"{DEVICE_CONFIG_FILE} not found.\n"
-                "Run find_port.py and calibration.py on this machine first.",
-                [("Retry", "confirm", None), ("Quit", "quit", None)])
-            self._await({"confirm"})
-            raise RuntimeError(f"{DEVICE_CONFIG_FILE} missing")
-        with open(cfg_path) as f:
-            dcfg = json.load(f)
-        self.camera_id = dcfg["camera_id"]
-        self.robot_port = dcfg["robot_port"]
-
-        self._status("Starting up...", "Loading the vision model")
-        self.corner_cfg = CN.load_yaml_with_base("config://corner_detection.yaml")
-        self.vision = self._retry(self._make_vision, "Camera / vision init failed")
-
-        self._status("Starting up...", "Connecting to the robot arm")
-        self.motion = self._retry(self._make_motion, "Robot arm connection failed")
-
-        self._status("Starting up...", "Starting the chess engine")
-        self.engine = self._retry(
-            lambda: chess.engine.SimpleEngine.popen_uci(ENGINE_PATH),
-            "Chess engine failed to start")
-
-        self._status("Starting up...", "Homing the robot")
-        self._park()
-
-        self._status("Starting up...", "Finding the board")
-        self._retry(self._detect_corners, "Could not find the board")
-
-    def _park(self) -> None:
-        try:
-            self.motion.go_to_init()
-        except Exception as e:
-            log.warning("go_to_init failed: %s", e)
-
-    def _recover_robot(self) -> None:
-        self._status("Please wait", "Reconnecting to the robot arm...")
-        self.motion = self._retry(self._make_motion, "Robot arm reconnection failed")
-        self._park()
-
-    def _recover_engine(self) -> None:
-        self._status("Please wait", "Restarting the chess engine...")
-        try:
-            self.engine.quit()
-        except Exception:
-            pass
-        self.engine = self._retry(
-            lambda: chess.engine.SimpleEngine.popen_uci(ENGINE_PATH),
-            "Chess engine restart failed")
-
-    def _recover_vision(self) -> None:
-        self._status("Please wait", "Recovering the camera...")
-        self.vision = self._retry(self._make_vision, "Camera recovery failed")
-        self._retry(self._detect_corners, "Could not find the board")
-        self._camera_fail_count = 0
-
-    def _write_stop(self) -> None:
-        try:
-            STOP_SENTINEL.write_text(time.strftime("%Y-%m-%d %H:%M:%S"),
-                                     encoding="utf-8")
-        except Exception:
-            log.exception("could not write stop sentinel")
-
-    def _cleanup(self) -> None:
-        for closer in (
-            lambda: self.engine.quit() if self.engine else None,
-            lambda: self.motion.disconnect() if self.motion else None,
-            lambda: self.vision.release() if self.vision else None,
-        ):
-            try:
-                closer()
-            except Exception:
-                pass
-
-    # ----- engine / robot moves with recovery ------------------------------ #
-    def _engine_play(self, board: chess.Board) -> chess.Move:
-        attempts = 0
-        while True:
-            try:
-                result = self.engine.play(board, chess.engine.Limit(time=ENGINE_THINK_TIME_S))
-                if result.move is None:
-                    raise RuntimeError("engine returned no move")
-                return result.move
-            except OperatorQuit:
-                raise
-            except Exception as e:
-                attempts += 1
-                log.exception("engine.play failed (attempt %d)", attempts)
-                if attempts >= 4:
-                    raise
-                self._recover_engine()
-
-    def _robot_move(self, uci: str, board: chess.Board) -> None:
-        while True:
-            try:
-                self.motion.move_robot(uci, board)
-                return
-            except OperatorQuit:
-                raise
-            except Exception as e:
-                log.exception("robot move failed")
-                self._overlay_show(
-                    "Robot needs attention",
-                    f"The arm could not finish its move.\n\n"
-                    f"{type(e).__name__}: {e}\n\n"
-                    "An attendant: clear any obstruction, then press Retry.",
-                    [("Retry", "confirm", None), ("Quit", "quit", None)])
-                self._await({"confirm"})
-                self._overlay_hide()
-                self._recover_robot()
-
-    # ----- detection ------------------------------------------------------- #
-    def _detect_move(self, board: chess.Board) -> list:
-        self._park()
-        seen: dict = {}
-        for i in range(1, DETECTION_ITERATIONS + 1):
-            self._status("Reading the board...", f"Scan {i} of {DETECTION_ITERATIONS}")
-            try:
-                occ = self.vision.detect_occupancy()
-            except Exception as e:
-                log.warning("occupancy read failed: %s", e)
-                self._camera_fail_count += 1
-                if self._camera_fail_count >= CAMERA_FAILS_BEFORE_RECOVER:
-                    self._recover_vision()
-                continue
-            self._camera_fail_count = 0
-            if occ is None:
-                continue
-            departed, arrived = self.vision.get_occupancy_diff()
-            if departed or arrived:
-                for m in infer_move_candidates(board, departed, arrived):
-                    seen.setdefault(m.uci(), m)
-            self.vision.pop_last_occupancy()
-        return list(seen.values())
-
-    # ----- per-turn flow --------------------------------------------------- #
-    def _maybe_promotion(self, board: chess.Board, move: chess.Move):
-        if move.promotion is not None:
-            return move
-        if board.piece_type_at(move.from_square) != chess.PAWN:
-            return move
-        dst_rank = chess.square_rank(move.to_square)
-        last_rank = (board.turn == chess.WHITE and dst_rank == 7) or \
-                    (board.turn == chess.BLACK and dst_rank == 0)
-        if not last_rank:
-            return move
-        self._status("Pawn promotion!", "Which piece did you place on the board?")
-        self._actions([("1  Queen", "number", 1), ("2  Rook", "number", 2),
-                       ("3  Bishop", "number", 3), ("4  Knight", "number", 4)])
-        while True:
-            kind, value = self._await({"number", "newgame"})
-            if kind == "newgame":
-                raise NewGameRequest
-            if value in PROMO_BY_NUMBER:
-                return chess.Move(move.from_square, move.to_square,
-                                  promotion=PROMO_BY_NUMBER[value])
-
-    def _pick_candidate(self, board: chess.Board, candidates: list):
-        self._status("Which move did you play?", "Tap the move you made.")
-        specs = [(f"{i}.  {board.san(m)}", "number", i)
-                 for i, m in enumerate(candidates, 1)]
-        specs.append(("None - scan again", "confirm", None))
-        self._actions(specs)
-        while True:
-            kind, value = self._await({"number", "confirm", "newgame"})
-            if kind == "newgame":
-                raise NewGameRequest
-            if kind == "confirm":
-                return None
-            if isinstance(value, int) and 1 <= value <= len(candidates):
-                return candidates[value - 1]
-
-    def _human_turn(self, board: chess.Board) -> None:
-        color = "White" if self.human_color == chess.WHITE else "Black"
-        while True:
-            self._render(board)
-            self._status(f"Your move  ({color})",
-                         "Make your move on the board, then press SPACE / ENTER.")
-            self._actions([("I've moved   (Space)", "confirm", None)])
-            kind, _ = self._await({"confirm", "newgame"})
-            if kind == "newgame":
-                raise NewGameRequest
-
-            self._actions([])
-            candidates = self._detect_move(board)
-
-            if not candidates:
-                self._render(board)
-                self._status("No move detected",
-                             "Make sure the pieces match the screen, "
-                             "then press SPACE / ENTER to scan again.")
-                self._actions([("Scan again   (Space)", "confirm", None)])
-                kind, _ = self._await({"confirm", "newgame"})
-                if kind == "newgame":
-                    raise NewGameRequest
-                continue
-
-            if len(candidates) == 1:
-                move = self._maybe_promotion(board, candidates[0])
-            else:
-                choice = self._pick_candidate(board, candidates)
-                if choice is None:
-                    continue
-                move = self._maybe_promotion(board, choice)
-
-            board.push(move)
-            log.info("Human move: %s", move.uci())
-            self._render(board)
+    def _update_camera(self, v: View) -> None:
+        vis = self.c.vision
+        if vis is None:
             return
-
-    def _robot_turn(self, board: chess.Board) -> None:
-        self._render(board)
-        self._status("Robot's turn", "The robot is thinking...")
-        self._actions([])
-        move = self._engine_play(board)
-        san = board.san(move)
-        self._status("Robot's turn", f"The robot plays {san}. Moving the piece...")
-        self._robot_move(move.uci(), board)
-        board.push(move)
-        log.info("Robot move: %s", move.uci())
-        self._render(board)
-
-    def _prepare_game(self, board: chess.Board, first: bool) -> None:
-        self._newgame_evt.clear()
-        self._render(board)
-        self._overlay_hide()
-        if first:
-            self._status("Ready to play",
-                         "Set the pieces in the starting position, "
-                         "then press SPACE / ENTER to begin.")
+        if v.phase == "board":
+            # board lost / moved: show the live camera big, where the board was
+            big = vis.preview((self.board_px, self.board_px), full=True)
+            if big is not None:
+                self._big_photo = ImageTk.PhotoImage(Image.fromarray(big))
+                self.board_canvas.delete("all")
+                self.board_canvas.create_image(self.board_px / 2, self.board_px / 2,
+                                               image=self._big_photo)
+                self.board_canvas.create_text(self.board_px / 2, self.P(30),
+                                              text="LIVE CAMERA", fill=TONES["warn"],
+                                              font=self.F(20, "bold"))
+                self._board_key = None  # redraw the board once we're back
+        img = vis.preview(self.cam_size)
+        if img is not None:
+            self._cam_photo = ImageTk.PhotoImage(Image.fromarray(img))
+            self.cam_lbl.configure(image=self._cam_photo)
+        cam = self.c.camera
+        if cam is not None and getattr(cam, "error", None):
+            self.cam_state.configure(text="● NO SIGNAL", fg=TONES["error"])
+        elif v.hand:
+            self.cam_state.configure(text="● HAND IN VIEW", fg=TONES["warn"])
         else:
-            self._status("New game",
-                         "Reset every piece to the starting position, "
-                         "then press SPACE / ENTER to begin.")
-        self._actions([("Start   (Space)", "confirm", None)])
-        self._await({"confirm"})
-
-        self.vision.update_occupancy_from_board(board)
-
-        self._status("Calibrating the camera...",
-                     "Tuning piece detection to the current lighting.")
-        self._actions([])
-        self._park()
-        try:
-            result = self.vision.grid_search_threshold(board)
-            self.vision.occupancy_threshold = result["best"]
-            self.last_threshold = result["best"]
-            log.info("Grid search: threshold=%.3f accuracy=%d/%d",
-                     result["best"], result["accuracy"], result["total"])
-        except Exception as e:
-            log.warning("grid search failed, keeping threshold %.3f: %s",
-                        self.vision.occupancy_threshold, e)
-
-    def _game_over(self, board: chess.Board) -> None:
-        self._render(board)
-        outcome = board.outcome(claim_draw=True)
-        if outcome is None:
-            reason = "Game over"
-        else:
-            term = outcome.termination.name.replace("_", " ").title()
-            if outcome.winner is None:
-                reason = f"{term} - draw ({board.result()})"
-            else:
-                winner = "White" if outcome.winner == chess.WHITE else "Black"
-                reason = f"{term} - {winner} wins ({board.result()})"
-        self._status("Game over", reason)
-        self._actions([("New game   (Space)", "newgame", None)])
-
-        def tick(remaining):
-            self.sub_var.set(f"{reason}\nA new game starts in {remaining}s "
-                             f"(press Space to start now).")
-
-        self._await({"confirm", "newgame"}, timeout=GAMEOVER_AUTORESET_S, on_tick=tick)
-
-    def _play_loop(self) -> None:
-        board = chess.Board()
-        self._prepare_game(board, first=True)
-        while True:
-            try:
-                while not board.is_game_over(claim_draw=True):
-                    if board.turn == ROBOT_COLOR:
-                        self._robot_turn(board)
-                    else:
-                        self._human_turn(board)
-                    self.vision.update_occupancy_from_board(board)
-                self._game_over(board)
-            except NewGameRequest:
-                log.info("New game requested.")
-            board = chess.Board()
-            self._prepare_game(board, first=False)
-
-    # ----- worker thread --------------------------------------------------- #
-    def _worker(self) -> None:
-        while True:
-            try:
-                self._init_hardware()
-                self._play_loop()
-            except OperatorQuit:
-                log.info("Operator quit.")
-                self._write_stop()
-                self._cleanup()
-                self._post(self.root.destroy)
-                return
-            except Exception as e:
-                log.exception("Fatal error in game loop")
-                self._park()
-                self._actions([])
-                self._overlay_show(
-                    "Something went wrong",
-                    f"{type(e).__name__}: {e}\n\n"
-                    "The kiosk will restart. An attendant can press Restart now.",
-                    [("Restart", "confirm", None), ("Quit", "quit", None)])
-                try:
-                    self._await({"confirm"})
-                except OperatorQuit:
-                    self._write_stop()
-                    self._cleanup()
-                    self._post(self.root.destroy)
-                    return
-                self._overlay_hide()
-                self._cleanup()
-                # Loop back around to a full re-initialisation.
+            self.cam_state.configure(text="● LIVE", fg=TONES["good"])
 
     def run(self) -> None:
-        worker = threading.Thread(target=self._worker, daemon=True)
-        worker.start()
-        self.root.after(UI_POLL_MS, self._drain_ui)
+        self.c.worker = threading.Thread(target=self.c.run, daemon=True, name="game")
+        self.c.worker.start()
+        self.root.after(100, self._refresh)
         self.root.mainloop()
 
 
-def main() -> None:
-    # Resolve relative paths (calibration.json, device_config.json, recap
-    # config:// roots) regardless of how the kiosk is auto-started.
-    os.chdir(HERE)
-    log.info("Kiosk starting (robot plays %s)",
-             "WHITE" if ROBOT_COLOR == chess.WHITE else "BLACK")
+def setup_logging() -> None:
+    config.LOG_DIR.mkdir(exist_ok=True)
+    h = logging.handlers.RotatingFileHandler(config.LOG_DIR / "kiosk.log",
+                                             maxBytes=5_000_000, backupCount=5)
+    logging.basicConfig(level=logging.INFO, handlers=[h, logging.StreamHandler()],
+                        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+
+
+def main(argv=None) -> None:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--sim", action="store_true", help="simulate camera and robot")
+    ap.add_argument("--windowed", action="store_true", help="don't go full screen")
+    args = ap.parse_args(argv)
+    os.chdir(config.HERE)
+    setup_logging()
+    log.info("kiosk starting (sim=%s)", args.sim)
+    ctl = Controller(sim=args.sim)
+    # Whatever ends the program, the arm ends up limp (torque off).
+    atexit.register(lambda: ctl.arm and ctl.arm.limp())
+    app = Kiosk(ctl, fullscreen=config.FULLSCREEN and not args.windowed)
+    stopped_by = []
+
+    def on_signal(signum, _frame):
+        # Ctrl+C, kill, closed terminal: limp right away, no parking move.
+        stopped_by.append(signum)
+        log.warning("signal %s - arm goes limp, exiting", signal.Signals(signum).name)
+        ctl.emergency_limp()
+        app.root.quit()
+    for sig in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, on_signal)
     try:
-        KioskApp().run()
-    except Exception:
-        log.exception("Kiosk crashed during startup")
-        raise
-    log.info("Kiosk exited.")
+        app.run()
+    finally:
+        ctl.shutdown()
+    log.info("kiosk exited")
+    logging.shutdown()
+    # Exit right away: background camera/vision threads may sit inside native
+    # code, and tearing the interpreter down around them can abort the process.
+    os._exit(128 + stopped_by[0] if stopped_by else 0)
 
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
