@@ -146,4 +146,5 @@ check("second OK carries on", True)
 ctl.send("quit")
 time.sleep(0.5)
 print("moves:", " ".join(m.uci() for m in ctl.board.move_stack))
-sys.exit(1 if fails else 0)
+sys.stdout.flush()
+os._exit(1 if fails else 0)  # skip interpreter teardown around native threads

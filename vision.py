@@ -245,8 +245,96 @@ def auto_find_corners(frame: np.ndarray) -> Optional[np.ndarray]:
     pts = pts.reshape(7, 7, 2)
     ideal = np.float32([[i + 1, j + 1] for j in range(7) for i in range(7)])
     H, _ = cv2.findHomography(ideal, pts.reshape(-1, 2).astype(np.float32))
-    outer = np.float32([[0, 8], [8, 8], [8, 0], [0, 0]])
+    ox, oy = grid_offset(frame, H)
+    outer = np.float32([[0, 8], [8, 8], [8, 0], [0, 0]]) + np.float32([ox, oy])
     return cv2.perspectiveTransform(outer[None], H)[0]
+
+
+GRID_CELL_PX = 24
+
+
+def _grid_patches(frame: np.ndarray, H: np.ndarray, lo: int, hi: int):
+    """Lab colour near the four corners of every grid cell in [lo, hi)^2
+    (grid units; the detected board is [0, 8)). A piece stands in the middle
+    of its square, so the corners show the square's own colour even on a
+    crowded rank. Returns (k, k, 4, 3) medians and a (k, k) in-frame mask."""
+    px = GRID_CELL_PX
+    n = (hi - lo) * px
+    M = H @ np.array([[1.0 / px, 0, lo], [0, 1.0 / px, lo], [0, 0, 1]])
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+    w = cv2.warpPerspective(lab, M, (n, n), flags=cv2.INTER_AREA | cv2.WARP_INVERSE_MAP)
+    inside = cv2.warpPerspective(np.full(frame.shape[:2], 255, np.uint8), M, (n, n),
+                                 flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP)
+    k = hi - lo
+    m, q = px // 8, px // 4                       # skip the grid lines
+    cells = w.reshape(k, px, k, px, 3).astype(np.float32)
+    patches = [cells[:, r0:r0 + q, :, c0:c0 + q] for r0 in (m, px - m - q)
+               for c0 in (m, px - m - q)]
+    med = np.stack([np.median(p.transpose(0, 2, 1, 3, 4).reshape(k, k, -1, 3), axis=2)
+                    for p in patches], axis=2)
+    valid = inside.reshape(k, px, k, px).min(axis=(1, 3)) > 0
+    return med, valid
+
+
+def grid_offset(frame: np.ndarray, H: np.ndarray, search: int = 1):
+    """Which 8x8 block of the detected grid is the chessboard?
+
+    The corner detector only sees a 7x7 lattice of corners. When pieces hide
+    one edge row of corners it can latch onto a lattice one row/column off,
+    using the board's printed border as the missing row - the board then
+    comes out shifted by a whole square (one rank cut off, one row of
+    margin added). Same problem as chesscog's "inferring missing lines"
+    step (Wölflein & Arandjelović 2021, sec. 4.1.3); here it is solved with
+    the checker pattern itself:
+
+    * the light and dark square colours are learned from the middle of the
+      detected grid (board for sure, whichever way it is off)
+    * every corner patch of every cell is classified light / dark / neither
+      (pieces, table clutter -> neither, so they can't tip the balance)
+    * an 8x8 window scores +1 for each patch with the colour its square
+      should have and -1 for the opposite colour; a plain margin cancels
+      out, and a window that has board squares just outside it (= is one
+      square off) is penalised for them.
+
+    Returns the (dx, dy) grid shift, in squares, of the best window."""
+    lo, hi = -search - 1, 9 + search       # + the row just outside every window
+    try:
+        med, valid = _grid_patches(frame, H, lo, hi)
+    except cv2.error:
+        return 0, 0
+    k = hi - lo
+    par = np.add.outer(np.arange(k) + lo, np.arange(k) + lo) % 2     # 0/1 per cell
+    core = np.zeros((k, k), bool)
+    core[2 - lo:6 - lo, 2 - lo:6 - lo] = True
+    core &= valid
+    if core.sum() < 8:
+        return 0, 0
+    c0 = np.median(med[core & (par == 0)].reshape(-1, 3), axis=0)
+    c1 = np.median(med[core & (par == 1)].reshape(-1, 3), axis=0)
+    gap = float(np.linalg.norm(c0 - c1))
+    if gap < 15:                               # no clear checker pattern
+        return 0, 0
+    d0 = np.linalg.norm(med - c0, axis=-1)
+    d1 = np.linalg.norm(med - c1, axis=-1)
+    near = 0.45 * gap
+    vote = (d0 < near).astype(np.float32) - (d1 < near)              # +1 colour 0, -1 colour 1
+    sig = np.where(valid, vote.sum(axis=2) * np.where(par == 0, 1.0, -1.0), 0.0)
+    best, best_s, scores = (0, 0), -np.inf, {}
+    for dy in range(-search, search + 1):
+        for dx in range(-search, search + 1):
+            y0, x0 = dy - lo, dx - lo
+            ys, xs = slice(y0, y0 + 8), slice(x0, x0 + 8)
+            s = float(sig[ys, xs].sum())
+            # just outside the real board there is no checker pattern
+            s -= sum(max(0.0, float(e.sum())) for e in (sig[y0 - 1, xs], sig[y0 + 8, xs],
+                                                        sig[ys, x0 - 1], sig[ys, x0 + 8]))
+            scores[dx, dy] = s
+            if s > best_s:
+                best, best_s = (dx, dy), s
+    if best != (0, 0):
+        log.info("board detector was off by %s squares - corrected (scores %s)", best,
+                 {k: round(v) for k, v in scores.items()})
+    return best
 
 
 # --------------------------------------------------------------------------- #
@@ -708,6 +796,7 @@ class Vision:
     def __init__(self, camera, geometry: Optional[BoardGeometry]):
         self.camera = camera
         self.lean_k = geometry.lean_k if geometry is not None else 0.0
+        self.lean_pending = True     # learn piece lean at the first start position
         self.centres = square_centres()
         self._geometry = None
         self.geometry = geometry
@@ -871,15 +960,22 @@ class Vision:
         geo = self.geometry
         if img is None or geo is None:
             return
-        k, table = fit_lean(img, board, geo, self.frame.shape if self.frame is not None else None)
-        if abs(k - self.lean_k) > 1e-6:
-            log.info("piece lean: %.2f (was %.2f)", k, self.lean_k)
-        self.lean_k = k
-        self.geometry = geo                      # recompute the sampling points
+        k, table = self.lean_k, None
+        if self.lean_pending:
+            # once per camera calibration (start-up or the Calibrate button),
+            # never re-learned behind the operator's back between games
+            k, table = fit_lean(img, board, geo,
+                                self.frame.shape if self.frame is not None else None)
+            if abs(k - self.lean_k) > 1e-6:
+                log.info("piece lean: %.2f (was %.2f)", k, self.lean_k)
+            self.lean_k = k
+            self.lean_pending = False
+            self.geometry = geo                  # recompute the sampling points
         feats = square_features(_lab(img), self.centres)
         self.colour.add(feats, board_states(board), start=True)
         if self.recorder is not None:
             self.recorder.event("learn_start", lean_k=k, lean_scores=table,
+                                lean_learned=table is not None,
                                 colour_ready=self.colour.ready,
                                 image=self.recorder.image("start", img))
 

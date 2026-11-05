@@ -441,6 +441,8 @@ class Controller:
                 if st["kind"] in ("ok", "camera_moved"):
                     v.geometry.save()
                     off = float(st.get("offset", 0.0))
+                    if off > config.BOARD_UPDATE_PX:
+                        v.lean_pending = True   # re-learn lean at the next start position
                     self._set(phase="board", cam_cal="done", tone="good",
                               headline="Camera calibrated",
                               detail="The camera hadn't moved - nothing to correct."
