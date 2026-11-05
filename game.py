@@ -12,7 +12,6 @@ from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 
 import chess
-import numpy as np
 
 import config
 import debuglog
@@ -63,6 +62,7 @@ class View:
     buttons: Tuple = ()
     progress: Optional[float] = None       # 0..1 countdown / activity bar
     busy: bool = False                     # animated bar: checking, please wait
+    cam_cal: str = ""                      # camera calibration: "" | pending | running | done | failed
     overlay: Optional[Tuple[str, str]] = None
     hand: bool = False
     engine_name: str = ""
@@ -88,7 +88,7 @@ class Controller:
         self._newgame = threading.Event()
         self.games_played = 0
         self.rec = debuglog.get()          # detailed debug recording (debuglog.py)
-        self._last_board_check = 0.0
+        self._calibrating = False
 
     # ------------------------------------------------------------------ #
     # view / actions plumbing
@@ -128,6 +128,13 @@ class Controller:
 
     def send(self, action: str, value=None) -> None:
         self.rec.event("action", action=action, value=value)
+        if action == "calibrate_camera":
+            # a flag, not a queued action: queued presses are cleared at
+            # some steps of the game, and this request must never get lost
+            if not self._calibrating and not self.view.cam_cal:
+                self._set(cam_cal="pending")   # the button reacts at once
+                self._cal_requested = True
+            return
         if action == "quit":
             self._quit.set()
         elif action == "newgame":
@@ -138,6 +145,12 @@ class Controller:
         """Return the next visitor action (or None), raising on quit / new game."""
         if self._quit.is_set():
             raise OperatorQuit
+        if getattr(self, "_cal_requested", False) and not self._calibrating:
+            # handled wherever the game happens to be waiting; the screen
+            # returns to the same place afterwards
+            self._cal_requested = False
+            self._calibrate_camera()
+            return None
         try:
             a = self._actions.get(timeout=timeout) if timeout else self._actions.get_nowait()
         except queue.Empty:
@@ -335,7 +348,6 @@ class Controller:
         names = [d["name"] for d in config.DIFFICULTIES]
         self._flush()  # a leftover key from the last game must not start this one
         while True:
-            self._periodic_board_check()
             mismatch = self.vision.start_position_mismatch() or []
             hl = {s: HL_PROBLEM for s in mismatch}
             buttons = [Button(n, "difficulty", i,
@@ -358,11 +370,9 @@ class Controller:
                 break
         self.engine.set_difficulty(self.difficulty_idx)
         self._set(phase="starting", headline="Getting ready...", tone="info", buttons=(),
-                  detail="Checking the camera view of the board.")
+                  detail="Checking the camera view of the board.", busy=True)
         if not self.vision.wait_stable(timeout=5):
             log.warning("scene not still at game start")
-        if not self.sim:  # the camera / board may have moved since the last game
-            self._ensure_board(force=True)
         first = self.vision.start_reference is None
         mismatch = None if first else self.vision.start_position_mismatch()
         if first or not mismatch:
@@ -375,7 +385,6 @@ class Controller:
         if first:
             self.vision.remember_start_position()
         self.vision.set_reference(self.board, trusted=False)
-        self._last_board_check = time.time()
         self.games_played += 1
         log.info("game %d start (difficulty %s)", self.games_played, names[self.difficulty_idx])
         self.rec.event("game_start", game=self.games_played,
@@ -401,114 +410,73 @@ class Controller:
     # ------------------------------------------------------------------ #
     # board / camera movement
     # ------------------------------------------------------------------ #
-    def _periodic_board_check(self) -> None:
-        """Re-detect the board every BOARD_RECHECK_S while nobody is reaching
-        in, so a camera that was bumped is re-registered quietly. A failed
-        look-up is NOT an alarm here (pieces can hide the grid mid-game); the
-        move detector asks for help if the view really stops making sense."""
+    def _calibrate_camera(self) -> None:
+        """Operator / visitor pressed "Calibrate camera" (or C): find the
+        board in the camera image again. The screen shows the live camera big
+        while it looks, then says what it found; on failure it offers Try
+        again / Cancel (keeping the previous calibration). Afterwards the
+        screen returns to whatever it showed before."""
         v = self.vision
-        if time.time() - self._last_board_check < config.BOARD_RECHECK_S or not v.is_stable():
+        if self._calibrating:
             return
-        self._last_board_check = time.time()
-        try:
-            st = v.board_status(attempts=1)
-        except Exception:
-            log.exception("periodic board check failed")
+        if v is None:
+            self._set(cam_cal="")
             return
-        if st["kind"] == "camera_moved":
-            v.geometry.save()
-        elif st["kind"] != "ok":
-            log.info("periodic board check: %s (ignored)", st["kind"])
-
-    def _ensure_board(self, force: bool = False) -> None:
-        """Make sure vision is registered on the board and the board is where
-        the arm expects it. Camera moves are absorbed silently; a board that
-        slid away from the arm makes us ask the visitor to push it back."""
-        v = self.vision
-        if not force and v.alignment_shift() < config.BOARD_DRIFT_PX:
-            return
-        saved_view = self.view
+        self._calibrating = True
+        saved = self.view
         quitting = lambda: self._quit.is_set()  # noqa: E731
-        n = config.BOARD_LOST_RETRIES
-        # Only ask for help once we are SURE: several failed look-ups in a row
-        # (a visitor's arm over the board must not trigger the prompt). After
-        # the first miss, show what's going on so it never looks frozen.
-        for attempt in range(n):
-            if attempt:
-                self._set(phase="board", headline="Looking for the chessboard...",
-                          tone="info", overlay=None, buttons=(), progress=attempt / n,
-                          detail=f"Attempt {attempt + 1} of {n}. Please keep hands away from "
-                                 "the board for a moment.")
-            v.wait_stable(timeout=3, min_s=0.3, cancel=quitting)
-            self._poll()  # honours Quit / New game
-            st = v.board_status()
-            if st["kind"] in ("ok", "camera_moved"):
-                if st["kind"] == "camera_moved" or st.get("offset", 0) > 1.0:
-                    v.geometry.save()
-                if attempt:
-                    with self._vlock:
-                        self._view = replace(saved_view, version=self._view.version + 1)
-                return
-            log.info("board check %d/%d: %s", attempt + 1, n, st["kind"])
-            self._sleep(0.7)
-        log.warning("board check: %s", st)
-        v.show_home = st["kind"] == "board_moved"
-        v.show_grid = st["kind"] != "lost"
-        checks = n
         try:
             while True:
-                status = f"\n\nChecked {checks} times - I keep looking automatically."
-                if st["kind"] == "lost":
-                    self._set(phase="board", headline="I can't see the chessboard",
-                              tone="error", overlay=None, progress=None,
-                              detail="Something may be covering the board, or the camera "
-                                     "was moved too far. Please make sure the camera sees the "
-                                     "whole board (live view on the left)." + status,
-                              buttons=(Button("Check again", "recheck", key="Space"),))
-                else:
-                    off = st.get("offset", 0)
-                    self._set(phase="board", headline="The board has moved", tone="warn",
-                              overlay=None, progress=None,
-                              detail="The robot needs the board where it was set up. Please "
-                                     "slide the board so its corners match the yellow outline "
-                                     f"in the camera view (off by {off:.0f} px)." + status,
-                              buttons=(Button("Check again", "recheck", key="Space"),
-                                       Button("Keep it here (attendant)", "rehome",
-                                              style="secondary")))
-                a = self._wait_for({"recheck", "rehome"}, timeout=1.5, flush=False)
-                if a[0] == "rehome" and st["kind"] == "board_moved":
-                    frame, _, _ = self.camera.read()
-                    v.geometry = V.BoardGeometry(v.geometry.corners)
-                    v.geometry.save()
-                    V.save_home_background(frame, v.geometry)
-                    log.warning("attendant accepted new board position as home")
-                    break
-                if not v.wait_stable(timeout=2, min_s=0.4, cancel=quitting):
-                    self._poll()
-                    continue
-                self._set(detail=self.view.detail.split("\n\nChecked")[0]
-                          + "\n\nChecking now...", progress=0.5)
-                st = v.board_status()
-                checks += 1
+                self._set(phase="board", cam_cal="running", tone="info", overlay=None,
+                          headline="Calibrating the camera",
+                          detail="Finding the chessboard in the camera picture. Please keep "
+                                 "hands away from the board for a moment.",
+                          buttons=(), progress=None, busy=True)
+                v.wait_stable(timeout=4, min_s=0.4, cancel=quitting)
+                if quitting():
+                    raise OperatorQuit
+                self._set(detail="Measuring the board...", busy=True)
+                st = v.board_status(attempts=5)
+                log.info("camera calibration: %s", st)
                 if st["kind"] in ("ok", "camera_moved"):
                     v.geometry.save()
+                    off = float(st.get("offset", 0.0))
+                    self._set(phase="board", cam_cal="done", tone="good",
+                              headline="Camera calibrated",
+                              detail="The camera hadn't moved - nothing to correct."
+                              if off < 1.5 else
+                              f"The camera had shifted by {off:.0f} pixels - corrected.",
+                              buttons=(), busy=False)
+                    self._sleep(2.5)
                     break
-                v.show_home = st["kind"] == "board_moved"
-                v.show_grid = st["kind"] != "lost"
+                v.show_grid = False
+                why = ("The board seems to have moved away from where the robot expects it."
+                       if st["kind"] == "board_moved" else
+                       "Make sure the whole board is in the camera picture (on the left) "
+                       "and nothing is covering it.")
+                self._set(phase="board", cam_cal="failed", tone="error",
+                          headline="Couldn't find the chessboard",
+                          detail=why + " The previous calibration is still in use.",
+                          buttons=(Button("Try again", "cal_retry", key="Space"),
+                                   Button("Cancel", "cal_cancel", style="secondary")),
+                          busy=False)
+                a = self._wait_for({"cal_retry", "cal_cancel"})
+                v.show_grid = True
+                if a[0] == "cal_cancel":
+                    break
         finally:
-            v.show_home = False
             v.show_grid = True
-        log.info("board back in place")
-        with self._vlock:
-            self._view = replace(saved_view, version=self._view.version + 1)
+            self._calibrating = False
+            with self._vlock:      # back to what was on screen before
+                self._view = replace(saved, cam_cal="", version=self._view.version + 1)
+            self.rec.event("screen", phase=saved.phase, headline=saved.headline,
+                           detail=saved.detail, restored=True)
 
     # ------------------------------------------------------------------ #
     # robot turn
     # ------------------------------------------------------------------ #
     def _robot_turn(self) -> None:
         b = self.board
-        if not self.sim:
-            self._ensure_board()
         self._set(phase="robot_think", headline="Robot is thinking...", tone="robot",
                   detail="", buttons=(), progress=None, **self._board_view())
         move = self.engine.best_move(b)
@@ -703,7 +671,6 @@ class Controller:
         rejected: set = set()
         unclear_since: Optional[float] = None
         last_seq, last_infer = -1, 0.0
-        last_board_check = 0.0
         inf: Optional[V.Inference] = None
         manual_btn = Button("I've moved", "moved", style="secondary", key="Space")
         prompt = f"Your move ({color})"
@@ -759,11 +726,6 @@ class Controller:
             self._set(hand=False)
             if not v.is_stable() or not config.AUTO_DETECT:
                 continue
-            if pending is None and unclear_since is None:
-                before_check = self._last_board_check
-                self._periodic_board_check()
-                if self._last_board_check != before_check:
-                    continue     # that took a moment: look at a fresh frame
             if time.time() - idle_since > config.IDLE_RESET_S:
                 log.info("idle timeout - abandoning game")
                 raise NewGame
@@ -796,14 +758,6 @@ class Controller:
                 choice = self._choose(inf.moves, "Which move did you play?")
                 if choice is not None:
                     return self._commit(choice)
-            elif inf.status == "unclear" and not self.sim and len(inf.changed) >= 4 \
-                    and time.time() - last_board_check > 5:
-                last_board_check = time.time()
-                before = v.geometry.corners.copy()
-                self._ensure_board(force=True)
-                if float(np.abs(v.geometry.corners - before).max()) > 1.5:
-                    unclear_since = None   # re-registered: look again with the fixed view
-                continue
             elif inf.status == "unclear":
                 pending = None
                 if unclear_since is None:
@@ -813,9 +767,12 @@ class Controller:
                               **self._board_view({s: HL_DETECT for s in inf.changed[:6]}))
                 elif time.time() - unclear_since > config.UNEXPLAINED_HINT_S:
                     names = ", ".join(chess.square_name(s) for s in inf.changed[:6])
+                    many = len(inf.changed) >= 6
                     self._set(headline="That doesn't look like a legal move",
                               detail=f"Changes on {names}. Please check those squares - "
-                                     "or press 'I've moved' to pick your move.",
+                                     "or press 'I've moved' to pick your move." +
+                                     (" If the camera was moved, press Calibrate camera "
+                                      "(C)." if many else ""),
                               tone="warn", buttons=(manual_btn,),
                               **self._board_view({s: HL_PROBLEM for s in inf.changed[:6]}))
             else:  # still

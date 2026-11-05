@@ -715,6 +715,10 @@ class Vision:
         self.recorder = None                          # debuglog.Recorder (optional)
         self.reference: Optional[np.ndarray] = None   # rectified board BGR (padded)
         self.reference_board: Optional[chess.Board] = None
+        self._ref_feats: Optional[np.ndarray] = None
+        # live empty / white / black verdict per square, for the UI overlay
+        self.detected: Optional[np.ndarray] = None    # (64, 3) probabilities
+        self._detected_t = 0.0
         self.start_reference: Optional[np.ndarray] = None
         self._lock = threading.Lock()
         self._prev_small = None
@@ -793,6 +797,12 @@ class Vision:
                 self.stable_since = now
             self.board_img = padded
             self.frame, self.frame_seq = frame, seq
+        if self.colour.ready and time.time() - self._detected_t >= 1.0 / config.DETECT_OVERLAY_HZ:
+            self._detected_t = time.time()
+            feats = square_features(_lab(padded), self.centres)
+            ref = self._ref_feats
+            shift = 0.0 if ref is None else float(np.median(feats[:, 0] - ref[:, 0]))
+            self.detected = self.colour.posterior(feats, shift)
         rec = self.recorder
         if rec is not None:
             rec.feed(frame, frame_t)
@@ -843,8 +853,9 @@ class Vision:
         with self._lock:
             self.reference = img
             self.reference_board = board.copy(stack=False) if board is not None else None
+        feats = square_features(_lab(img), self.centres)
+        self._ref_feats = feats
         if board is not None and trusted:
-            feats = square_features(_lab(img), self.centres)
             self.colour.add(feats, board_states(board))
         if self.recorder is not None:
             self.recorder.event("reference", fen=board.fen() if board is not None else None,
@@ -1045,9 +1056,12 @@ class Vision:
         return sorted(bad)
 
     # ---- preview for the UI -------------------------------------------- #
-    def preview(self, size=(480, 360), full: bool = False) -> Optional[np.ndarray]:
-        """Camera frame cropped around the board with the grid and the
-        highlighted squares projected back - 'what the robot sees'."""
+    def preview(self, size=(480, 360), full: bool = False,
+                board: Optional[chess.Board] = None) -> Optional[np.ndarray]:
+        """'What the robot sees': the camera frame (whole, or cropped around
+        the board) with the grid and highlighted squares projected back. With
+        `board` (the game position) it also marks what the colour model
+        currently sees on every square - see _draw_pieces."""
         with self._lock:
             frame = self.frame
             highlight = dict(self.highlight)
@@ -1055,6 +1069,7 @@ class Vision:
             return None
         img = frame.copy()
         geo = self.geometry
+        sc = min(size[0] / img.shape[1], size[1] / img.shape[0]) if full else None
         if geo is not None and self.show_grid:
             overlay = img.copy()
             for sq, col in highlight.items():
@@ -1073,6 +1088,9 @@ class Vision:
                                     [PAD + b[0] * S, PAD + b[1] * S]])
                     q = cv2.perspectiveTransform(p[None], geo.H_inv)[0].astype(int)
                     cv2.line(img, tuple(q[0]), tuple(q[1]), (90, 220, 255), 1, cv2.LINE_AA)
+            det = self.detected
+            if board is not None and det is not None:
+                img = self._draw_pieces(img, geo, det, board, sc or 0.5)
             if not full:
                 x, y, w, h = cv2.boundingRect(np.vstack([geo.corners, geo.home]).astype(np.int32))
                 m = int(0.12 * max(w, h))
@@ -1084,6 +1102,43 @@ class Vision:
         img = cv2.resize(img, (max(1, int(img.shape[1] * sc)), max(1, int(img.shape[0] * sc))),
                          interpolation=cv2.INTER_AREA)
         return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+    def _draw_pieces(self, img, geo, det, board: chess.Board, scale: float) -> np.ndarray:
+        """Semi-transparent marker where each piece is SEEN (the lean-corrected
+        sampling point): a light disc = white piece, a dark disc = black
+        piece, nothing = empty. The letter is the piece the game says is on
+        that square (the camera only tells the colour). Red ring = the camera
+        disagrees with the game: wrong colour, a piece where the square
+        should be empty ("?"), or nothing seen where a piece should be."""
+        pts = cv2.perspectiveTransform(self.centres[None].astype(np.float32), geo.H_inv)[0]
+        sq_px = float(np.linalg.norm(geo.corners[1] - geo.corners[0])) / 8
+        r = max(3, int(0.28 * sq_px))
+        th = max(1, int(round(1.5 / scale)))          # outline: ~1.5 px once shrunk
+        text_th = max(1, r // 8)
+        font = r / 22
+        overlay = img.copy()
+        state = det.argmax(axis=1)
+        for s in chess.SQUARES:
+            x, y = int(pts[s][0]), int(pts[s][1])
+            want = square_state(board, s)
+            got = int(state[s])
+            bad = got != want
+            if got == EMPTY:
+                if bad:   # a piece should be here but none is seen
+                    cv2.circle(overlay, (x, y), r, (40, 40, 235), th * 2, cv2.LINE_AA)
+                continue
+            fill, ink = ((235, 240, 245), (40, 40, 40)) if got == WHITE else \
+                ((35, 35, 35), (235, 235, 235))
+            cv2.circle(overlay, (x, y), r, fill, -1, cv2.LINE_AA)
+            cv2.circle(overlay, (x, y), r, (40, 40, 235) if bad else ink, th * (2 if bad else 1),
+                       cv2.LINE_AA)
+            p = board.piece_at(s)
+            txt = p.symbol().upper() if p is not None and not bad else "?"
+            (tw, tht), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, font, text_th)
+            cv2.putText(overlay, txt, (x - tw // 2, y + tht // 2), cv2.FONT_HERSHEY_SIMPLEX,
+                        font, ink, text_th, cv2.LINE_AA)
+        return cv2.addWeighted(overlay, 0.6, img, 0.4, 0)
 
 
 def orient_corners(frame: np.ndarray, corners: np.ndarray) -> np.ndarray:

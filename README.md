@@ -26,7 +26,7 @@ pieces. Built for unattended exhibition use on a **Jetson Orin Nano**
 ./setup.sh                          # venv + Python packages + Stockfish (arm64)
 sudo usermod -aG dialout $USER      # once: serial-port access (log out/in afterwards)
 .venv/bin/python find_port.py       # camera + arm port -> device_config.json
-.venv/bin/python calibration.py     # teach 32 floor poses + capture, rest, gripper-open
+.venv/bin/python calibration.py     # teach 32 floor poses (CALIBRATION_SQUARES) + capture, rest, gripper-open
 .venv/bin/python calibration.py --verify   # arm visits every square to check
 ./run_kiosk.sh                      # exhibition mode (auto-restarts on crash)
 ```
@@ -49,16 +49,19 @@ To start the kiosk on login: `cp dorothy-kiosk.desktop ~/.config/autostart/`.
 `calibration.py` switches the motors off so you can move the arm by hand,
 then asks for:
 
-1. The **FLOOR pose of 32 squares**: every other square (all the dark
-   squares: a1, c1, e1, g1, b2, d2, ...): jaws open around the piece's base,
-   just above the board. Squares taught before can be skipped with **S**.
+1. The **FLOOR pose of `CALIBRATION_SQUARES` squares** (`config.py`, 3 to
+   64, default 32; or `calibration.py --squares N` for one run): jaws open
+   around the piece's base, just above the board. The squares are spread
+   evenly over the board (32 = all the dark squares, 64 = every square);
+   calibration prints the list. Squares taught before can be skipped with
+   **S**.
 2. **Capture**: one pose where captured pieces are dropped (above a tray).
 3. **Rest**: one pose, completely out of the camera's view.
 4. **Gripper open**, then a small squeeze so it learns which way closes.
 
-That's 35 poses in total; no lift poses are taught.
+That's N + 3 poses in total; no lift poses are taught.
 
-* **Floor poses for the other 32 squares** come from a kinematic model that
+* **Floor poses for the remaining squares** come from a kinematic model that
   uses the SO-101's known dimensions from the official URDF (upper arm
   116 mm, forearm 135 mm, shoulder 30.4 mm ahead of the base axis, jaw hinge
   84.5 mm past the wrist-flex axis) plus `GRIPPER_TIP_MM`. Only the servo
@@ -78,7 +81,9 @@ That's 35 poses in total; no lift poses are taught.
 In simulation (SO-101 geometry, 37.5 mm squares, ±4-tick teaching noise,
 gripper held at varying angles) computed floor poses land within 2.8 mm on
 average (5 mm worst; with the former 12 taught squares: 3–4 mm, 6–8 mm
-worst), and lifts stay within about 2 mm of vertical. On the
+worst), and lifts stay within about 2 mm of vertical. Average error by number
+of taught squares (simulated): 3 squares ~7 mm, 4–5 ~5 mm, 6–12 ~4–8 mm,
+32 ~3 mm. With fewer than about 8, check the result with `--verify`. On the
 real arm the fit independently estimated the squares at 36.8 mm, which
 confirms the geometry.
 
@@ -101,7 +106,7 @@ kept, and lift poses are recomputed with the rule above.
 | Part | File | What it does |
 |---|---|---|
 | Vision | `vision.py` | After every move the rectified board image is stored. Once nothing is moving in view (no hand or arm), each square's change is measured (colour difference, compensated for lighting drift and slightly nudged pieces) and every *legal* move is scored by how well it explains the change. **Piece lean:** a top-down camera sees tall pieces leaning away from the point below it, so pieces near the edges and corners appear shifted outward; each square is sampled where its piece is actually seen (the amount is learned from the starting position every game). **Piece colour:** every square is also classified as empty / white piece / black piece by a model learned from the start position and retrained after every confirmed move (so it adapts to the lighting, and to cream pieces on white squares); a move must also leave the right colour on every square it touches. Captures, castling, en passant and promotions are recognised, and colour settles cases where two moves would explain the same changes. ~150 ms per check on the Orin CPU; no GPU or PyTorch needed. |
-| Board & camera | `vision.py` | The board is found automatically, even with pieces on it, and a1 is identified from the starting position. It is re-detected every 10 s while nobody is reaching in (`BOARD_RECHECK_S`), so a bumped camera is re-registered quietly; also at start-up, every new game, before robot moves, and whenever the view stops making sense. Only after several failures in a row does the screen ask for help, showing the live camera large. |
+| Board & camera | `vision.py` | The board is found automatically, even with pieces on it, and a1 is identified from the starting position. It is found once at start-up; after that it is only re-detected when someone presses **Calibrate camera** (top right of the screen, or the **C** key). That shows the live camera large while it looks, then reports whether the camera had shifted (and corrects it), or offers Try again / Cancel if the board can't be found (the previous calibration stays in use). It works at any point in a game and returns to the same screen afterwards; pressed during a robot move, it runs as soon as the arm is done. If the camera seems to have moved (many squares change at once), the screen suggests pressing it. |
 | Game flow | `game.py` | Moves are detected hands-free: once a legal move is seen with no hand in view it is confirmed after 1 s and the robot replies. "Not my move", a manual picker and "I've moved" remain as fallbacks. After each robot move the arm returns to rest and the camera checks the board. If the visitor already played their reply while the arm was moving, both moves are recognised and the robot carries straight on. If something looks off, the screen highlights the squares and asks the visitor to fix them and press **OK** ("Checking the board..." shows while it looks); if it still looks different it says so, and a second OK carries on. |
 | Arm | `robot.py`, `servo_bus.py` | Lightweight direct Feetech driver (no `lerobot`). Smooth minimum-jerk motion, settle-before-grip, torque-sensed gripping (closes until it feels the piece, then holds firmly a little further closed; it never opens until the piece is placed), raise-then-swing travel to rest and capture so it never sweeps over pieces, auto-reconnect. |
 | Calibration model | `arm_model.py` | Pan fitted as a rotation about the base; lift/elbow/wrist by the kinematic model above (cross-validated against simpler fits by jaw-tip error); lift poses computed straight above each floor pose. |
@@ -144,6 +149,8 @@ near-perfect moves with random blunders, which felt hard to most visitors.
     directly, and **Enter / Space** starts the game.
   * During a game: the same keys move the yellow highlight between the
     buttons, and **Enter / Space** press the highlighted one.
+  * **C** (or the button at the top right): calibrate the camera, i.e. find
+    the board in the picture again after the camera was moved or bumped.
 * **Operator:**
   * **Ctrl+Shift+Q**: quit. Shows "Shutting down", stops the arm's motion
     and closes within a few seconds, whatever the robot is doing. The arm
@@ -184,9 +191,10 @@ then keep their last state until power-cycled.
 .venv/bin/python tests/test_vision_sim.py      # random games incl. leaning pieces + colour
 .venv/bin/python tests/stress_vision_sim.py    # noise, lighting, nudged pieces
 .venv/bin/python tests/test_board_motion.py    # camera/board movement handling
-.venv/bin/python tests/test_arm_model.py       # reduced calibration accuracy
+.venv/bin/python tests/test_arm_model.py [N..] # reduced calibration accuracy (for N taught squares)
 .venv/bin/python tests/test_robot_fakebus.py   # gripper sensing/holding force + move sequence
 .venv/bin/python tests/test_game_flow.py       # reply during robot move, "board wrong" prompt
+.venv/bin/python tests/test_camera_calibration.py  # Calibrate camera button: feedback, bumped camera, failure
 .venv/bin/python tests/test_kiosk_keys.py      # keyboard navigation
 .venv/bin/python tests/test_kiosk_quit.py      # Ctrl+Shift+Q while the robot is busy
 .venv/bin/python tests/ui_demo.py shots/ 8     # scripted end-to-end kiosk run

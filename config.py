@@ -96,12 +96,9 @@ VISION_HZ = 15                   # processing rate of the vision thread
 DETECT_CONFIRM_S = 1.0           # auto-detect: countdown before committing
 AUTO_DETECT = True               # detect the human move without a button press
 BOARD_FIXED_TO_ROBOT = True      # exhibition: arm + board fixed, only the camera may move
-BOARD_LOST_RETRIES = 4           # failed board look-ups in a row before asking for help
 BOARD_HOME_TOL_PX = 7.0          # board this far from where the arm expects it -> ask
-BOARD_DRIFT_PX = 2.5             # rectified-view shift that triggers a re-check
 UNEXPLAINED_HINT_S = 4.0         # show "check the board" after this long
 USE_COLOUR = True                # also judge moves by empty / white / black per square
-BOARD_RECHECK_S = 10.0           # re-detect the board (camera bumped?) this often while idle
 BOARD_UPDATE_PX = 1.0            # ignore re-detections that moved less than this
 
 # --------------------------------------------------------------------------- #
@@ -140,6 +137,12 @@ GRIP_SQUEEZE_S = 0.25            # full-force squeeze after contact, then hold f
 GRIP_OVERLOAD_MARGIN = 30        # hold this far (0.1 % units) below the servo's overload threshold
 GRIPPER_HOLD_TORQUE = None       # optional extra cap on the holding force (0..1000)
 
+# Calibration: how many squares are taught by hand (3..64). They are spread
+# evenly over the board; every other square is computed. More = more accurate
+# (simulated average error: ~2.8 mm with 32, ~4-5 mm with 12, worse below 8).
+# 32 = every dark square, 64 = all of them (nothing computed).
+CALIBRATION_SQUARES = 32
+
 # Geometry used by the reduced calibration (arm_model.py)
 GRIPPER_TIP_MM = 75.0            # jaw hinge axis -> gripping point, along the gripper (SO-101: 75 mm)
 LIFT_HEIGHT_SQUARES = 4.0        # lift poses: jaw tip this many squares above the board
@@ -155,6 +158,7 @@ SUBTITLE = "The chess-playing robot arm"
 IDLE_RESET_S = 15 * 60           # abandon a game nobody touched for this long
 GAMEOVER_AUTORESET_S = 120
 CAMERA_PREVIEW_FPS = 12
+DETECT_OVERLAY_HZ = 4.0          # how often the camera panel's piece markers refresh
 SIM_STYLE = "real"               # --sim look: "real" (green board, leaning pieces) or "flat"
 
 # --------------------------------------------------------------------------- #

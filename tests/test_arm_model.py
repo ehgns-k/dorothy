@@ -84,10 +84,9 @@ def tip_target(name, z):
 
 
 fails = 0
-NINE = ["a1", "e1", "h1", "a4", "d5", "h4", "a8", "e8", "h8"]
-cases = [(f"{len(AM.ANCHORS)} floor poses, square size given", AM.ANCHORS, SQ),
-         (f"{len(AM.ANCHORS)} floor poses, square size estimated", AM.ANCHORS, None),
-         ("9 floor poses, square size given", NINE, SQ)]
+COUNTS = [int(a) for a in sys.argv[1:]] or [3, 6, 12, 32]
+cases = [(f"{n} floor poses, square size given", AM.anchor_squares(n), SQ) for n in COUNTS]
+cases.append(("32 floor poses, square size estimated", AM.anchor_squares(32), None))
 for label, anchors, sq_mm in cases:
     cal = teach(anchors, 4.0, 8.0)
     config.SQUARE_SIZE_MM = sq_mm
@@ -103,14 +102,15 @@ for label, anchors, sq_mm in cases:
         lift_xy.append(np.linalg.norm(tip_lift[:2] - tip_floor[:2]))
         want_h = m["lift_lowered"].get(s, m["lift_mm"])
         lift_z.append(abs((tip_lift[2] - tip_floor[2]) - want_h))
-    fe = np.array(floor_err)
+    fe = np.array(floor_err or [0.0])   # 64 taught: nothing computed
     print(f"{label:40s} floor tip mean {fe.mean():4.1f} max {fe.max():4.1f} mm | "
           f"lift off-vertical max {max(lift_xy):4.1f} mm, height err max {max(lift_z):4.1f} mm"
           f" | square={m['square_mm']}mm, lift={m['lift_mm']}mm, "
           f"lowered on {len(m['lift_lowered'])} squares")
     # floor poses must be precise; computed lifts only need to be roughly
-    # vertical (floor-only data can't pin the shoulder zero exactly)
-    if label.startswith(str(len(AM.ANCHORS))) and "given" in label and (fe.max() > 0.25 * SQ or max(lift_xy) > 14
-                                                   or max(lift_z) > 14):
+    # vertical (floor-only data can't pin the shoulder zero exactly).
+    # Below 12 squares accuracy is reported, not required.
+    if len(anchors) >= 12 and (fe.size and fe.max() > 0.25 * SQ or max(lift_xy) > 14
+                               or max(lift_z) > 14):
         fails += 1
 sys.exit(1 if fails else 0)

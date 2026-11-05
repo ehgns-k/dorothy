@@ -31,13 +31,36 @@ TICKS_PER_RAD = 4096 / (2 * math.pi)
 ARM = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"]
 RADIAL = ["shoulder_lift", "elbow_flex", "wrist_flex"]
 
-# Spread over the whole board: corners, edge middles and the inner area.
-# every other square (all dark squares, a1 included): 32 taught floor poses.
-# Every square then has a taught neighbour, so the residual correction below
-# turns the kinematic fit into a local interpolation.
-ANCHORS = [chess.square_name(s) for s in chess.SQUARES
-           if (chess.square_file(s) + chess.square_rank(s)) % 2 == 0]
-MIN_ANCHORS = 8
+MIN_ANCHORS, MAX_ANCHORS = 3, 64
+
+
+def anchor_squares(n: Optional[int] = None) -> List[str]:
+    """The squares to teach: `n` of them (CALIBRATION_SQUARES by default,
+    3..64), spread as evenly as possible over the board.
+
+    32 = every other square (all dark squares), so every computed square
+    sits between taught ones; 64 = all squares. Otherwise: the four corners
+    first (a1 and h1 nearest the arm), then repeatedly the square farthest
+    from every square chosen so far. More squares = more accurate, since what
+    the arm model can't explain is corrected from nearby taught squares."""
+    n = int(config.CALIBRATION_SQUARES if n is None else n)
+    n = max(MIN_ANCHORS, min(MAX_ANCHORS, n))
+    if n == 64:
+        return list(chess.SQUARE_NAMES)
+    if n == 32:
+        return [chess.square_name(s) for s in chess.SQUARES
+                if (chess.square_file(s) + chess.square_rank(s)) % 2 == 0]
+    xy = {s: (chess.square_file(s), chess.square_rank(s)) for s in chess.SQUARES}
+    chosen = [chess.A1, chess.H1, chess.H8, chess.A8][:n]
+    while len(chosen) < n:
+        def gap(s):
+            return min((xy[s][0] - xy[c][0]) ** 2 + (xy[s][1] - xy[c][1]) ** 2 for c in chosen)
+        rest = [s for s in chess.SQUARES if s not in chosen]
+        chosen.append(max(rest, key=lambda s: (gap(s), -s)))
+    return [chess.square_name(s) for s in sorted(chosen)]
+
+
+ANCHORS = anchor_squares()
 RBF_LEN = 2.0  # squares: how far an anchor's residual correction reaches
 
 
@@ -93,6 +116,12 @@ class _PoseModel:
                 h[k] = 1e-4 if k != 2 else 1e-2
                 J[:, k] = (self._pan_pred(prm + h, self.xy, sign) - y - r) / h[k]
             A = J.T @ J + lam * np.diag(np.diag(J.T @ J) + 1e-9)
+            if len(y) < 6:
+                # too few squares to also pin down the jaw's sideways offset:
+                # keep it at 0 (it is small) so the base position stays well posed
+                A[3, :] = A[:, 3] = 0.0
+                A[3, 3] = 1.0
+                J[:, 3] = 0.0
             step = np.linalg.solve(A, -J.T @ r)
             new = prm + step
             if np.sum((self._pan_pred(new, self.xy, sign) - y) ** 2) < np.sum(r ** 2):

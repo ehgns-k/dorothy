@@ -1,15 +1,17 @@
 """
 Teach the arm where the board is.
 
-    python calibration.py            quick: FLOOR pose of 32 squares (every dark square) + capture, rest,
-                                     gripper-open. Every other floor pose and ALL lift
-                                     poses are computed (arm_model.py)
+    python calibration.py            FLOOR pose of CALIBRATION_SQUARES squares (config.py,
+                                     3..64; default 32 = every dark square) + capture,
+                                     rest, gripper-open. Every other floor pose and ALL
+                                     lift poses are computed (arm_model.py)
+    python calibration.py --squares 12     same, teaching 12 squares this time
     python calibration.py --verify   visit every computed square to check it;
                                      press F on a square that's off to teach it
     python calibration.py --teach e4 g7    (re)teach specific squares, then refit
     python calibration.py --full     teach all 64 floor poses by hand
     python calibration.py --check    with a FULL calibration: how well would the
-                                     32-square model have predicted it?
+                                     reduced model have predicted it?
 
 While teaching, torque is OFF - move the arm by hand:
     ENTER/SPACE = record pose     S = skip (keep existing)     Ctrl+C = stop
@@ -196,13 +198,13 @@ def run_verify(t: Teacher) -> None:
         run_quick(t, bad, specials=False)
 
 
-def run_check(t: Teacher) -> None:
-    errs = arm_model.leave_one_out(t.cal, arm_model.ANCHORS)
+def run_check(t: Teacher, anchors) -> None:
+    errs = arm_model.leave_one_out(t.cal, anchors)
     if not errs:
         print("Need a full calibration (all 64 squares) for --check.")
         return
     worst = sorted(errs.items(), key=lambda kv: -max(kv[1].values()))
-    print(f"\nPredicting {len(errs)} squares from the {len(arm_model.ANCHORS)} anchors {arm_model.ANCHORS}:")
+    print(f"\nPredicting {len(errs)} squares from the {len(anchors)} anchors {anchors}:")
     for j in ARM_JOINTS:
         v = [e[j] for e in errs.values()]
         print(f"  {j:14s} mean {sum(v) / len(v):5.1f}  max {max(v):5.1f} ticks")
@@ -222,12 +224,17 @@ def main() -> None:
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--teach", nargs="+", metavar="SQUARE")
+    ap.add_argument("--squares", type=int, metavar="N",
+                    help="how many squares to teach (3..64; default CALIBRATION_SQUARES)")
     args = ap.parse_args()
+    anchors = arm_model.anchor_squares(args.squares)
+    if args.squares is not None and not 3 <= args.squares <= 64:
+        print(f"--squares must be 3..64; using {len(anchors)}")
     t = Teacher()
     start = time.time()
     try:
         if args.check:
-            run_check(t)
+            run_check(t, anchors)
         elif args.verify:
             run_verify(t)
         elif args.teach:
@@ -235,7 +242,11 @@ def main() -> None:
         elif args.full:
             run_quick(t, list(chess.SQUARE_NAMES))
         else:
-            run_quick(t, arm_model.ANCHORS)
+            print(f"Teaching {len(anchors)} squares: {' '.join(anchors)}")
+            if len(anchors) < 8:
+                print("(few squares: expect computed squares to be off by 5-10 mm; "
+                      "check them with --verify)")
+            run_quick(t, anchors)
     except KeyboardInterrupt:
         print("\nStopped - everything recorded so far is saved.")
     finally:

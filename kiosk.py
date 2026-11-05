@@ -241,6 +241,16 @@ class Kiosk:
         head.pack(fill="x")
         tk.Label(head, text=config.TITLE, font=self.F(54, "bold"), fg=TEXT, bg=BG
                  ).pack(side="left")
+        # top right: re-find the board in the camera picture (shortcut C)
+        colors = BTN["secondary"]
+        self.cal_btn = tk.Button(head, text="", font=self.F(17, "bold"), bg=colors[0],
+                                 fg=colors[1], activebackground=colors[2],
+                                 activeforeground=colors[1], relief="flat", bd=0, takefocus=0,
+                                 highlightthickness=0, padx=P(22), pady=P(12), cursor="hand2",
+                                 command=self._calibrate_camera)
+        self.cal_btn.pack(side="right", anchor="n", pady=(P(10), 0))
+        self._cal_state = None
+        self._set_cal_button("", "")
         tk.Label(right, text=config.SUBTITLE, font=self.F(22), fg=MUTED, bg=BG, anchor="w"
                  ).pack(fill="x")
         self.info_lbl = tk.Label(right, text="", font=self.F(16), fg=MUTED, bg=BG, anchor="w",
@@ -270,6 +280,8 @@ class Kiosk:
         bottom.pack(fill="both", expand=True)
         cam = tk.Frame(bottom, bg=PANEL)
         cam.pack(side="left", fill="both", expand=True)
+        cam.pack_propagate(False)        # the image follows the panel, not the other way
+        self.cam_frame = cam
         cam_head = tk.Frame(cam, bg=PANEL)
         cam_head.pack(fill="x", padx=P(20), pady=(P(14), P(6)))
         tk.Label(cam_head, text="WHAT THE ROBOT SEES", font=self.F(14, "bold"), fg=MUTED,
@@ -278,10 +290,11 @@ class Kiosk:
                                   bg=PANEL)
         self.cam_state.pack(side="right")
         self.cam_lbl = tk.Label(cam, bg=PANEL)
-        self.cam_lbl.pack(expand=True, padx=P(14), pady=(0, P(14)))
-        self.cam_size = (P(460), P(330))
+        self.cam_lbl.pack(fill="both", expand=True, padx=P(14), pady=(0, P(14)))
+        self.cam_head = cam_head
+        self.cam_size = (P(460), P(330))   # updated to the panel's real size
 
-        moves = tk.Frame(bottom, bg=PANEL, width=P(300))
+        moves = tk.Frame(bottom, bg=PANEL, width=P(230))
         moves.pack(side="left", fill="y", padx=(P(18), 0))
         moves.pack_propagate(False)
         tk.Label(moves, text="MOVES", font=self.F(14, "bold"), fg=MUTED, bg=PANEL
@@ -321,6 +334,38 @@ class Kiosk:
         # Ctrl+Shift+Q / Ctrl+Shift+N, whatever Caps Lock or the layout says
         r.bind("<Control-KeyPress>", self._control_key)
         r.bind("<F11>", lambda e: self._toggle_fullscreen())
+        r.bind("c", lambda e: self._calibrate_camera())
+        r.bind("C", lambda e: self._calibrate_camera())
+
+    def _calibrate_camera(self) -> str:
+        if not getattr(self, "_quitting", False):
+            self.c.send("calibrate_camera")
+            self._set_cal_button(self.c.view.cam_cal, self.c.view.phase)  # react at once
+        return "break"
+
+    CAL_LABELS = {
+        "": ("\u2316  Calibrate camera   C", "secondary"),
+        "pending": ("\u23f3  Calibrating soon...", "busy"),
+        "pending_arm": ("\u23f3  After the robot's move...", "busy"),
+        "running": ("\u23f3  Calibrating...", "busy"),
+        "done": ("\u2713  Camera calibrated", "done"),
+        "failed": ("\u2715  Board not found", "failed"),
+    }
+    CAL_COLORS = {"secondary": BTN["secondary"], "busy": ("#3a3320", "#ffd166", "#3a3320"),
+                  "done": ("#173a2a", "#3ccf8e", "#173a2a"),
+                  "failed": ("#3a1c1c", "#ff7b7b", "#3a1c1c")}
+
+    def _set_cal_button(self, state: str, phase: str) -> None:
+        if state == "pending" and phase in ("robot_move", "robot_think"):
+            state = "pending_arm"     # the arm must finish first
+        if state == self._cal_state:
+            return
+        self._cal_state = state
+        text, style = self.CAL_LABELS.get(state, self.CAL_LABELS[""])
+        bg, fg, abg = self.CAL_COLORS[style]
+        self.cal_btn.configure(text=text, bg=bg, fg=fg, activebackground=abg,
+                               activeforeground=fg,
+                               cursor="hand2" if state == "" else "watch")
 
     def _toggle_fullscreen(self):
         self.fullscreen = not self.fullscreen
@@ -477,6 +522,7 @@ class Kiosk:
         self.accent.configure(bg=tone)
         self.headline.configure(text=v.headline)
         self.detail.configure(text=v.detail)
+        self._set_cal_button(v.cam_cal, v.phase)
         info = []
         if v.difficulty:
             info.append(f"Level: {v.difficulty}")
@@ -606,7 +652,10 @@ class Kiosk:
                                               text="LIVE CAMERA", fill=TONES["warn"],
                                               font=self.F(20, "bold"))
                 self._board_key = None  # redraw the board once we're back
-        img = vis.preview(self.cam_size)
+        fw, fh = self.cam_frame.winfo_width(), self.cam_frame.winfo_height()
+        if fw > 50 and fh > 50:   # fill the panel; the frame keeps its own aspect ratio
+            self.cam_size = (fw - 2 * self.P(14), fh - self.cam_head.winfo_height() - self.P(34))
+        img = vis.preview(self.cam_size, full=True, board=self.c.board)  # whole frame, uncropped
         if img is not None:
             self._cam_photo = ImageTk.PhotoImage(Image.fromarray(img))
             self.cam_lbl.configure(image=self._cam_photo)
